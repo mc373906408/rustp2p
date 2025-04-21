@@ -3,3 +3,27 @@ Cargo.lock
 .idea
 /src/protocol/proto
 wintun.dll
+/deploy
+/examples/c_examples/build*
+/include
+/openssl-arm
+
+# 编译生成的文件
+*.o
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.exe
+
+# 编辑器和IDE文件
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db

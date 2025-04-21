@@ -7,6 +7,9 @@ mod reliable;
 pub mod tunnel;
 #[cfg(feature = "use-kcp")]
 pub use reliable::*;
+// 导出FFI模块
+#[cfg(feature = "ffi")]
+pub mod ffi;
 
 use crate::config::DataInterceptor;
 use crate::protocol::protocol_type::ProtocolType;
@@ -23,6 +26,9 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tunnel::{PeerNodeAddress, RecvUserData, Tunnel, TunnelHubSender, TunnelManager};
 
+// 使用别名使ffi模块可以兼容
+#[cfg(feature = "ffi")]
+pub type Endpoint = EndPoint;
 pub struct EndPoint {
     #[cfg(feature = "use-kcp")]
     kcp_context: KcpContext,
@@ -172,7 +178,12 @@ impl Builder {
         if let Some(peers) = self.peers {
             config = config.set_direct_addrs(peers);
         }
-        #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+        #[cfg(any(
+            feature = "aes-gcm-openssl",
+            feature = "aes-gcm-ring",
+            feature = "chacha20-poly1305-openssl",
+            feature = "chacha20-poly1305-ring"
+        ))]
         if let Some(encryption) = self.encryption {
             config = config.set_encryption(encryption);
         }

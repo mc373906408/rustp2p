@@ -1,0 +1,35 @@
+language = "C"
+header = "/* RustP2P FFI C bindings - 自动生成，请勿手动修改 */"
+include_guard = "RUSTP2P_H"
+include_version = true
+braces = "SameLine"
+line_length = 100
+tab_width = 4
+documentation_style = "Auto"
+style = "Type"
+
+[export]
+prefix = ""
+include = ["EndpointHandle", "MessageCallback"]
+
+[parse]
+parse_deps = true
+include = ["rustp2p"]
+extra_bindings = ["rustp2p"]
+
+[defines]
+"feature = \"ffi\"" = "__RUSTP2P_FFI"
+"feature = \"aes-gcm\"" = "__RUSTP2P_AES_GCM"
+"feature = \"chacha20-poly1305\"" = "__RUSTP2P_CHACHA20_POLY1305"
+"feature = \"use-kcp\"" = "__RUSTP2P_USE_KCP"
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[fn]
+args = "Vertical"
+rename_args = "CamelCase"
+
+[macro_expansion]
+bitflags = true

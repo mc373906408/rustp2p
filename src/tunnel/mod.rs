@@ -87,7 +87,12 @@ impl TunnelManager {
                 x.push_str(":3478");
             }
         }
-        #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+        #[cfg(any(
+            feature = "aes-gcm-openssl",
+            feature = "aes-gcm-ring",
+            feature = "chacha20-poly1305-openssl",
+            feature = "chacha20-poly1305-ring"
+        ))]
         let cipher = config.encryption.clone().map(crate::cipher::Cipher::from);
 
         let config: rust_p2p_core::tunnel::config::TunnelConfig = config.into();
@@ -117,7 +122,12 @@ impl TunnelManager {
             local_tcp_port,
             default_interface.clone(),
             dns,
-            #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+            #[cfg(any(
+                feature = "aes-gcm-openssl",
+                feature = "aes-gcm-ring",
+                feature = "chacha20-poly1305-openssl",
+                feature = "chacha20-poly1305-ring"
+            ))]
             cipher,
         );
         if let Some(group_code) = group_code {
@@ -423,7 +433,7 @@ impl TunnelHubSender {
         {
             if &relay_group_code == group_code {
                 let route = self.route_table.get_route_by_id(&relay_node_id)?;
-                self.socket_manager.try_send_to(buf, &route.route_key())?;
+                self.socket_manager.try_send_to(buf, &route.route_key())?
             } else {
                 let route = self.get_other_route(relay_group_code, relay_node_id)?;
                 self.socket_manager.try_send_to(buf, &route.route_key())?
@@ -506,7 +516,12 @@ impl TunnelHubSender {
             packet.set_group_code(&group_code);
             packet.set_src_id(&src_id);
             packet.set_dest_id(dest_id);
-            #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+            #[cfg(any(
+                feature = "aes-gcm-openssl",
+                feature = "aes-gcm-ring",
+                feature = "chacha20-poly1305-openssl",
+                feature = "chacha20-poly1305-ring"
+            ))]
             if packet.is_user_data() {
                 self.encrypt(&mut packet, &src_id, dest_id)?;
             }
@@ -522,7 +537,12 @@ impl TunnelHubSender {
             Err(io::Error::new(io::ErrorKind::Other, "no id specified"))
         }
     }
-    #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+    #[cfg(any(
+        feature = "aes-gcm-openssl",
+        feature = "aes-gcm-ring",
+        feature = "chacha20-poly1305-openssl",
+        feature = "chacha20-poly1305-ring"
+    ))]
     fn encrypt(
         &self,
         packet: &mut SendPacket,
@@ -549,7 +569,12 @@ impl TunnelHubSender {
             packet.set_group_code(&group_code);
             packet.set_src_id(&src_id);
             packet.set_dest_id(dest_id);
-            #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+            #[cfg(any(
+                feature = "aes-gcm-openssl",
+                feature = "aes-gcm-ring",
+                feature = "chacha20-poly1305-openssl",
+                feature = "chacha20-poly1305-ring"
+            ))]
             if packet.is_user_data() {
                 self.encrypt(&mut packet, &src_id, dest_id)?;
             }
@@ -831,9 +856,19 @@ impl Tunnel {
         match self.handle(recv_result).await {
             Ok(handle_result) => {
                 if let Some(rs) = handle_result {
-                    #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+                    #[cfg(any(
+                        feature = "aes-gcm-openssl",
+                        feature = "aes-gcm-ring",
+                        feature = "chacha20-poly1305-openssl",
+                        feature = "chacha20-poly1305-ring"
+                    ))]
                     let mut rs = rs;
-                    #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+                    #[cfg(any(
+                        feature = "aes-gcm-openssl",
+                        feature = "aes-gcm-ring",
+                        feature = "chacha20-poly1305-openssl",
+                        feature = "chacha20-poly1305-ring"
+                    ))]
                     {
                         if rs.is_encrypt != self.node_context.cipher.is_some() {
                             return Ok(Ok(Err(HandleError::new(
@@ -1141,7 +1176,12 @@ impl Tunnel {
                         ttl: packet.ttl(),
                         max_ttl: packet.max_ttl(),
                         protocol: ProtocolType::MessageData.into(),
-                        #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+                        #[cfg(any(
+                            feature = "aes-gcm-openssl",
+                            feature = "aes-gcm-ring",
+                            feature = "chacha20-poly1305-openssl",
+                            feature = "chacha20-poly1305-ring"
+                        ))]
                         is_encrypt: packet.is_encrypt(),
                     }));
                 }
@@ -1196,7 +1236,12 @@ impl Tunnel {
                     ttl: packet.ttl(),
                     max_ttl: packet.max_ttl(),
                     protocol: protocol_type.into(),
-                    #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+                    #[cfg(any(
+                        feature = "aes-gcm-openssl",
+                        feature = "aes-gcm-ring",
+                        feature = "chacha20-poly1305-openssl",
+                        feature = "chacha20-poly1305-ring"
+                    ))]
                     is_encrypt: packet.is_encrypt(),
                 }))
             }
@@ -1380,7 +1425,12 @@ struct HandleResultInner {
     pub(crate) ttl: u8,
     pub(crate) max_ttl: u8,
     pub(crate) protocol: u8,
-    #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+    #[cfg(any(
+        feature = "aes-gcm-openssl",
+        feature = "aes-gcm-ring",
+        feature = "chacha20-poly1305-openssl",
+        feature = "chacha20-poly1305-ring"
+    ))]
     pub(crate) is_encrypt: bool,
 }
 #[derive(Copy, Clone, Debug)]
@@ -1508,7 +1558,12 @@ impl HandleError {
     }
 }
 
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(any(
+    feature = "aes-gcm-openssl",
+    feature = "aes-gcm-ring",
+    feature = "chacha20-poly1305-openssl",
+    feature = "chacha20-poly1305-ring"
+))]
 fn tag(src_id: &NodeID, dest_id: &NodeID) -> [u8; 12] {
     let mut tmp = [0; 12];
     tmp[..4].copy_from_slice(src_id.as_ref());
