@@ -51,15 +51,10 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 crossbeam-utils = { workspace = true }
 crossbeam-queue = { workspace = true }
-<<<<<<< HEAD
-
-async-shutdown = "0.2"
-=======
 flume = { workspace = true }
 kcp = { workspace = true, optional = true }
 tokio-util = { workspace = true }
 async-shutdown = { workspace = true }
->>>>>>> upstream/master
 rmp-serde = "1.3"
 dns-parser = "0.8"
 
