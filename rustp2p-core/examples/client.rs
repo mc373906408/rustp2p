@@ -22,12 +22,12 @@ use env_logger::Env;
 use parking_lot::Mutex;
 use rust_p2p_core::idle::IdleRouteManager;
 use rust_p2p_core::nat::NatInfo;
-use rust_p2p_core::punch::{PunchInfo, PunchModelBoxes, Puncher};
+use rust_p2p_core::punch::{PunchInfo, PunchModel, Puncher};
 use rust_p2p_core::route::route_table::RouteTable;
 use rust_p2p_core::route::ConnectProtocol;
 use rust_p2p_core::tunnel::config::{TcpTunnelConfig, TunnelConfig, UdpTunnelConfig};
 use rust_p2p_core::tunnel::tcp::LengthPrefixedInitCodec;
-use rust_p2p_core::tunnel::{new_tunnel_component, UnifiedSocketManager, UnifiedTunnel};
+use rust_p2p_core::tunnel::{new_tunnel_component, SocketManager, Tunnel};
 
 pub const HEAD_LEN: usize = 12;
 //
@@ -91,7 +91,6 @@ async fn main() {
     }
     let peer_list = Arc::new(Mutex::new(Vec::<u32>::new()));
     let peer_list1 = peer_list.clone();
-    let puncher1 = puncher.clone();
     let socket_manager1 = socket_manager.clone();
     let nat_info1 = nat_info.clone();
     tokio::spawn(async move {
@@ -114,7 +113,7 @@ async fn main() {
                     if peer_id <= my_id {
                         continue;
                     }
-                    if !route_table1.need_punch(&peer_id) || !puncher1.need_punch(&peer_id) {
+                    if !route_table1.need_punch(&peer_id) {
                         continue;
                     }
 
@@ -123,8 +122,7 @@ async fn main() {
                     request.put_u32(PUNCH_START_1);
                     request.put_u32(my_id);
                     request.put_u32(peer_id);
-                    let mut nat_info = nat_info1.lock().clone();
-                    nat_info.seq = rand::random();
+                    let nat_info = nat_info1.lock().clone();
                     let data = serde_json::to_string(&nat_info).unwrap();
                     request.extend_from_slice(data.as_bytes());
                     socket_manager1
@@ -177,11 +175,11 @@ struct ContextHandler {
     route_table: RouteTable<u32>,
     #[allow(dead_code)]
     server: SocketAddr,
-    socket_manager: UnifiedSocketManager,
+    socket_manager: SocketManager,
 }
 
 impl ContextHandler {
-    async fn handle(&self, mut tunnel: UnifiedTunnel) -> std::io::Result<()> {
+    async fn handle(&self, mut tunnel: Tunnel) -> std::io::Result<()> {
         let mut buf = [0; 65536];
         while let Some(rs) = tunnel.recv_from(&mut buf).await {
             let (len, route_key) = match rs {
@@ -217,8 +215,7 @@ impl ContextHandler {
                     let peer_nat_info: NatInfo =
                         serde_json::from_str(core::str::from_utf8(&buf[12..len]).unwrap()).unwrap();
                     log::info!("peer_id={src_id},peer_nat_info={peer_nat_info:?}");
-                    let mut nat_info = self.nat_info.lock().clone();
-                    nat_info.seq = peer_nat_info.seq;
+                    let nat_info = self.nat_info.lock().clone();
                     let data = serde_json::to_string(&nat_info).unwrap();
                     request.extend_from_slice(data.as_bytes());
                     self.socket_manager
@@ -234,11 +231,7 @@ impl ContextHandler {
                         let puncher = self.puncher.clone();
                         tokio::spawn(async move {
                             let rs = puncher
-                                .punch(
-                                    src_id,
-                                    &request,
-                                    PunchInfo::from_master(PunchModelBoxes::all(), peer_nat_info),
-                                )
+                                .punch(&request, PunchInfo::new(PunchModel::all(), peer_nat_info))
                                 .await;
                             log::info!("punch peer_id={src_id},{rs:?}")
                         });
@@ -255,11 +248,7 @@ impl ContextHandler {
                     let puncher = self.puncher.clone();
                     tokio::spawn(async move {
                         let rs = puncher
-                            .punch(
-                                src_id,
-                                &request,
-                                PunchInfo::from_slave(PunchModelBoxes::all(), peer_nat_info),
-                            )
+                            .punch(&request, PunchInfo::new(PunchModel::all(), peer_nat_info))
                             .await;
                         log::info!("punch peer_id={src_id},{rs:?}")
                     });
@@ -291,7 +280,7 @@ impl ContextHandler {
                         SocketAddr::from_str(core::str::from_utf8(&buf[12..len]).unwrap()).unwrap();
                     log::info!("public_addr={public_addr}");
                     let mut guard = self.nat_info.lock();
-                    if let Some(port) = guard.public_ports.get_mut(route_key.index_usize()) {
+                    if let Some(port) = guard.public_udp_ports.get_mut(route_key.index_usize()) {
                         *port = public_addr.port();
                     }
                 }
@@ -308,7 +297,7 @@ impl ContextHandler {
     }
 }
 
-async fn my_nat_info(socket_manager: &UnifiedSocketManager) -> Arc<Mutex<NatInfo>> {
+async fn my_nat_info(socket_manager: &SocketManager) -> Arc<Mutex<NatInfo>> {
     let stun_server = vec![
         "stun.miwifi.com:3478".to_string(),
         "stun.chat.bilibili.com:3478".to_string(),
@@ -334,7 +323,7 @@ async fn my_nat_info(socket_manager: &UnifiedSocketManager) -> Arc<Mutex<NatInfo
     let nat_info = NatInfo {
         nat_type,
         public_ips,
-        public_ports,
+        public_udp_ports: public_ports,
         mapping_tcp_addr: vec![],
         mapping_udp_addr: vec![],
         public_port_range: port_range,
@@ -343,7 +332,6 @@ async fn my_nat_info(socket_manager: &UnifiedSocketManager) -> Arc<Mutex<NatInfo
         local_udp_ports,
         local_tcp_port,
         public_tcp_port: 0,
-        seq: 0,
     };
     Arc::new(Mutex::new(nat_info))
 }

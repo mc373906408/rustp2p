@@ -1,9 +1,8 @@
 use crate::protocol::node_id::NodeID;
-use crate::tunnel::TunnelHubSender;
+use crate::tunnel::TunnelRouter;
 use bytes::{Buf, BytesMut};
 use kcp::Kcp;
 use parking_lot::{Mutex, RwLock};
-use rand::RngCore;
 use std::collections::HashMap;
 use std::io;
 use std::io::{Error, Write};
@@ -21,17 +20,14 @@ pub struct KcpStream {
     read: KcpStreamRead,
     write: KcpStreamWrite,
 }
-pub struct KcpStreamHub {
-    inner: Arc<KcpStreamHubInner>,
+pub struct KcpListener {
+    inner: Arc<KcpListenerInner>,
 }
-impl KcpStreamHub {
+impl KcpListener {
     pub async fn accept(&self) -> io::Result<(KcpStream, NodeID)> {
         self.inner.accept().await
     }
-    pub fn new_stream(&self, node_id: NodeID) -> io::Result<KcpStream> {
-        self.inner.new_stream(node_id)
-    }
-    fn downgrade(&self) -> Weak<KcpStreamHubInner> {
+    fn downgrade(&self) -> Weak<KcpListenerInner> {
         Arc::downgrade(&self.inner)
     }
 }
@@ -42,30 +38,40 @@ struct OwnedKcp {
 }
 
 type Map = Arc<RwLock<HashMap<(NodeID, u32), Sender<BytesMut>>>>;
-struct KcpStreamHubInner {
-    conv_id: Counter,
+struct KcpListenerInner {
     input_receiver: flume::Receiver<(NodeID, BytesMut)>,
     map: Map,
-    output: TunnelHubSender,
+    output: TunnelRouter,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct KcpContext {
+    conv: Counter,
     map: Map,
     #[allow(clippy::type_complexity)]
-    channel: Arc<Mutex<Option<(flume::Sender<(NodeID, BytesMut)>, Weak<KcpStreamHubInner>)>>>,
+    channel: Arc<Mutex<Option<(flume::Sender<(NodeID, BytesMut)>, Weak<KcpListenerInner>)>>>,
 }
+impl Default for KcpContext {
+    fn default() -> Self {
+        Self {
+            conv: Counter::new(rand::random()),
+            map: Arc::new(Default::default()),
+            channel: Arc::new(Default::default()),
+        }
+    }
+}
+#[derive(Clone)]
 struct Counter {
-    counter: AtomicU32,
+    counter: Arc<AtomicU32>,
 }
 impl Counter {
     fn new(v: u32) -> Self {
         Self {
-            counter: AtomicU32::new(v),
+            counter: Arc::new(AtomicU32::new(v)),
         }
     }
     fn add(&self) -> u32 {
-        self.counter.fetch_add(1, Ordering::Release)
+        self.counter.fetch_add(1, Ordering::Relaxed)
     }
 }
 impl KcpContext {
@@ -98,30 +104,36 @@ impl KcpContext {
     fn get_stream_sender(&self, node_id: NodeID, conv: u32) -> Option<Sender<BytesMut>> {
         self.map.read().get(&(node_id, conv)).cloned()
     }
-    pub(crate) fn create_kcp_hub(&self, sender: TunnelHubSender) -> KcpStreamHub {
+    pub(crate) fn create_kcp_hub(&self, sender: TunnelRouter) -> KcpListener {
         let mut guard = self.channel.lock();
         if let Some((_, hub)) = guard.as_ref() {
             if let Some(inner) = hub.upgrade() {
-                return KcpStreamHub { inner };
+                return KcpListener { inner };
             }
         }
         let (input_sender, input_receiver) = flume::bounded(128);
-        let inner = KcpStreamHubInner {
-            conv_id: Counter::new(rand::rng().next_u32()),
+        let inner = KcpListenerInner {
             input_receiver,
             map: self.map.clone(),
             output: sender,
         };
-        let hub = KcpStreamHub {
+        let hub = KcpListener {
             inner: Arc::new(inner),
         };
         guard.replace((input_sender, hub.downgrade()));
         hub
     }
+    pub(crate) fn new_stream(
+        &self,
+        output: TunnelRouter,
+        node_id: NodeID,
+    ) -> io::Result<KcpStream> {
+        KcpStream::new(node_id, self.conv.add(), self.map.clone(), output)
+    }
 }
 
-impl KcpStreamHubInner {
-    pub async fn accept(&self) -> io::Result<(KcpStream, NodeID)> {
+impl KcpListenerInner {
+    async fn accept(&self) -> io::Result<(KcpStream, NodeID)> {
         loop {
             let (node_id, bytes) = self
                 .input_receiver
@@ -164,9 +176,7 @@ impl KcpStreamHubInner {
             Err(Error::new(io::ErrorKind::NotFound, "not found stream"))
         }
     }
-    pub fn new_stream(&self, node_id: NodeID) -> io::Result<KcpStream> {
-        self.new_stream_impl(node_id, self.conv_id.add())
-    }
+
     fn new_stream_impl(&self, node_id: NodeID, conv: u32) -> io::Result<KcpStream> {
         KcpStream::new(node_id, conv, self.map.clone(), self.output.clone())
     }
@@ -280,11 +290,11 @@ impl KcpStream {
     }
 }
 impl KcpStream {
-    fn new(
+    pub(crate) fn new(
         node_id: NodeID,
         conv: u32,
         map: Map,
-        output_sender: TunnelHubSender,
+        output_sender: TunnelRouter,
     ) -> io::Result<Self> {
         let mut guard = map.write();
         if guard.contains_key(&(node_id, conv)) {
@@ -304,7 +314,7 @@ impl KcpStream {
         conv: u32,
         map: Map,
         input: Receiver<BytesMut>,
-        output_sender: TunnelHubSender,
+        output_sender: TunnelRouter,
     ) -> Self {
         let mut kcp = Kcp::new_stream(
             conv,
@@ -409,11 +419,11 @@ async fn all_event(
 ) -> io::Result<Event> {
     tokio::select! {
         rs=input.recv()=>{
-            let buf = rs.ok_or(Error::from(io::ErrorKind::Other))?;
+            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "input close"))?;
             Ok(Event::Input(buf))
         }
         rs=data_out_receiver.recv()=>{
-            let buf = rs.ok_or(Error::from(io::ErrorKind::Other))?;
+            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "output close"))?;
             Ok(Event::Output(buf))
         }
         _=interval.tick()=>{
@@ -424,7 +434,7 @@ async fn all_event(
 async fn input_event(input: &mut Receiver<BytesMut>, interval: &mut Interval) -> io::Result<Event> {
     tokio::select! {
         rs=input.recv()=>{
-            let buf = rs.ok_or(Error::from(io::ErrorKind::Other))?;
+            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "input close"))?;
             Ok(Event::Input(buf))
         }
         _=interval.tick()=>{
@@ -438,7 +448,7 @@ async fn output_event(
 ) -> io::Result<Event> {
     tokio::select! {
         rs=data_out_receiver.recv()=>{
-            let buf = rs.ok_or(Error::from(io::ErrorKind::Other))?;
+            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "output close"))?;
             Ok(Event::Output(buf))
         }
         _=interval.tick()=>{
@@ -455,7 +465,7 @@ enum Event {
 
 struct KcpOutput {
     node_id: NodeID,
-    sender: TunnelHubSender,
+    sender: TunnelRouter,
 }
 impl Write for KcpOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

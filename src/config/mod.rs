@@ -14,8 +14,7 @@ use crate::protocol::node_id::{GroupCode, NodeID};
 use crate::protocol::{NetPacket, HEAD_LEN};
 use crate::tunnel::{NodeAddress, PeerNodeAddress, RecvResult};
 pub use rust_p2p_core::nat::*;
-pub use rust_p2p_core::punch::config::{PunchModel, PunchModelBox};
-pub use rust_p2p_core::route::*;
+pub use rust_p2p_core::punch::config::{PunchModel, PunchPolicy, PunchPolicySet};
 pub use rust_p2p_core::socket::LocalInterface;
 pub use rust_p2p_core::tunnel::config::LoadBalance;
 use rust_p2p_core::tunnel::recycle::RecycleBuf;
@@ -26,13 +25,12 @@ pub(crate) mod punch_info;
 
 pub(crate) const ROUTE_IDLE_TIME: Duration = Duration::from_secs(10);
 
-pub struct TunnelManagerConfig {
+pub struct Config {
     pub load_balance: LoadBalance,
     pub major_socket_count: usize,
     pub route_idle_time: Duration,
     pub udp_tunnel_config: Option<UdpTunnelConfig>,
     pub tcp_tunnel_config: Option<TcpTunnelConfig>,
-    pub enable_extend: bool,
     pub group_code: Option<GroupCode>,
     pub self_id: Option<NodeID>,
     pub direct_addrs: Option<Vec<PeerNodeAddress>>,
@@ -57,12 +55,11 @@ pub struct TunnelManagerConfig {
     pub use_v6: bool,
 }
 
-impl Default for TunnelManagerConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
             load_balance: LoadBalance::MinHopLowestLatency,
             major_socket_count: MAX_MAJOR_SOCKET_COUNT,
-            enable_extend: false,
             udp_tunnel_config: Some(Default::default()),
             tcp_tunnel_config: Some(Default::default()),
             route_idle_time: ROUTE_IDLE_TIME,
@@ -109,13 +106,13 @@ impl Default for TunnelManagerConfig {
 pub(crate) const MAX_MAJOR_SOCKET_COUNT: usize = 2;
 pub(crate) const MAX_UDP_SUB_SOCKET_COUNT: usize = 82;
 
-impl TunnelManagerConfig {
+impl Config {
     pub fn none_tcp(self) -> Self {
         self
     }
 }
 
-impl TunnelManagerConfig {
+impl Config {
     pub fn empty() -> Self {
         Self::default()
     }
@@ -127,10 +124,7 @@ impl TunnelManagerConfig {
         self.major_socket_count = count;
         self
     }
-    pub fn set_enable_extend(mut self, enable_extend: bool) -> Self {
-        self.enable_extend = enable_extend;
-        self
-    }
+
     pub fn set_udp_tunnel_config(mut self, config: UdpTunnelConfig) -> Self {
         self.udp_tunnel_config.replace(config);
         self
@@ -288,8 +282,8 @@ impl UdpTunnelConfig {
     }
 }
 
-impl From<TunnelManagerConfig> for rust_p2p_core::tunnel::config::TunnelConfig {
-    fn from(value: TunnelManagerConfig) -> Self {
+impl From<Config> for rust_p2p_core::tunnel::config::TunnelConfig {
+    fn from(value: Config) -> Self {
         let recycle_buf = if value.recycle_buf_cap > 0 {
             Some(RecycleBuf::new(
                 value.recycle_buf_cap,
@@ -320,7 +314,6 @@ impl From<TunnelManagerConfig> for rust_p2p_core::tunnel::config::TunnelConfig {
             major_socket_count: value.major_socket_count,
             udp_tunnel_config,
             tcp_tunnel_config,
-            enable_extend: value.enable_extend,
         }
     }
 }
@@ -430,7 +423,7 @@ impl LengthPrefixedDecoder {
             self.buf.clear();
             return None;
         }
-        let packet = NetPacket::unchecked(self.buf.as_ref());
+        let packet = NetPacket::new_unchecked(self.buf.as_ref());
         let data_length = packet.data_length() as usize;
         if data_length > src.len() {
             return Some(Err(io::Error::new(io::ErrorKind::Other, "too short")));
@@ -454,7 +447,7 @@ impl LengthPrefixedDecoder {
         if offset < HEAD_LEN {
             return None;
         }
-        let packet = NetPacket::unchecked(&src);
+        let packet = NetPacket::new_unchecked(&src);
         let data_length = packet.data_length() as usize;
         if data_length > src.len() {
             return Some(Err(io::Error::new(io::ErrorKind::Other, "too short")));
@@ -473,7 +466,7 @@ impl LengthPrefixedDecoder {
 impl Encoder for LengthPrefixedEncoder {
     async fn encode(&mut self, write: &mut OwnedWriteHalf, data: &[u8]) -> io::Result<()> {
         let len = data.len();
-        let packet = NetPacket::unchecked(data);
+        let packet = NetPacket::new_unchecked(data);
         if packet.data_length() as usize != len {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }

@@ -1,8 +1,8 @@
 use clap::Parser;
 use env_logger::Env;
-use rustp2p::protocol::node_id::{GroupCode, NodeID};
-use rustp2p::tunnel::PeerNodeAddress;
+use rustp2p::node_id::NodeID;
 use rustp2p::Builder;
+use rustp2p::PeerNodeAddress;
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,13 +50,13 @@ pub async fn main() -> io::Result<()> {
         .tcp_port(port)
         .udp_port(port)
         .peers(addrs)
-        .group_code(string_to_group_code(&group_code))
+        .group_code(group_code.try_into().unwrap())
         .build()
         .await?;
-    let manager = endpoint.kcp_stream();
+    let kcp_listener = endpoint.kcp_listener();
 
     if let Some(request) = request {
-        let client_kcp_stream = manager.new_stream(NodeID::from(request))?;
+        let client_kcp_stream = endpoint.open_kcp_stream(NodeID::from(request))?;
         let (mut write, mut read) = client_kcp_stream.split();
         tokio::spawn(async move {
             let mut buf = [0; 1024];
@@ -76,7 +76,8 @@ pub async fn main() -> io::Result<()> {
         }
     } else {
         tokio::spawn(async move {
-            while let Ok((mut stream, remote_id)) = manager.accept().await {
+            while let Ok((mut stream, remote_id)) = kcp_listener.accept().await {
+                let remote_id: u32 = remote_id.into();
                 log::info!("=========== accept kcp_stream from {:?}", remote_id);
                 tokio::spawn(async move {
                     let mut buf = [0; 1024];
@@ -85,13 +86,19 @@ pub async fn main() -> io::Result<()> {
                             tokio::time::timeout(Duration::from_secs(100), stream.read(&mut buf))
                                 .await;
                         match result {
-                            Ok(rs) => {
-                                let len = rs.unwrap();
+                            Ok(Ok(len)) => {
+                                if len == 0 {
+                                    break;
+                                }
                                 log::info!(
                                     "read remote_id={remote_id:?},message={:?}",
                                     String::from_utf8(buf[..len].into())
                                 );
                                 stream.write_all(&buf[..len]).await.unwrap();
+                            }
+                            Ok(Err(e)) => {
+                                log::info!("read remote_id={remote_id:?},error={e:?}",);
+                                break;
                             }
                             Err(_) => {
                                 log::info!("read remote_id={remote_id:?} timeout");
@@ -107,12 +114,4 @@ pub async fn main() -> io::Result<()> {
     }
     log::info!("exit!!!!");
     Ok(())
-}
-
-fn string_to_group_code(input: &str) -> GroupCode {
-    let mut array = [0u8; 16];
-    let bytes = input.as_bytes();
-    let len = bytes.len().min(16);
-    array[..len].copy_from_slice(&bytes[..len]);
-    array.into()
 }

@@ -1,16 +1,14 @@
-use crate::tunnel::TunnelRouter;
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+use crate::Puncher;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub(crate) async fn query_tcp_public_addr_loop(
-    tunnel_tx: TunnelRouter,
-    tcp_stun_servers: Vec<String>,
-) {
+pub(crate) async fn query_tcp_public_addr_loop(puncher: Puncher) {
+    let tcp_stun_servers = puncher.punch_context.tcp_stun_servers.clone();
     log::debug!("tcp_stun_servers = {tcp_stun_servers:?}");
     let stun_num = tcp_stun_servers.len();
     if stun_num == 0 {
@@ -28,7 +26,7 @@ pub(crate) async fn query_tcp_public_addr_loop(
             match stun.to_socket_addrs() {
                 Ok(mut addr) => {
                     if let Some(addr) = addr.next() {
-                        if let Some(w) = tunnel_tx.socket_manager.tcp_socket_manager_as_ref() {
+                        if let Some(w) = puncher.socket_manager.tcp_socket_manager_as_ref() {
                             match tokio::time::timeout(
                                 Duration::from_secs(5),
                                 w.connect_reuse_port_raw(addr),
@@ -68,7 +66,7 @@ pub(crate) async fn query_tcp_public_addr_loop(
                         match stun_tcp_read(&mut tcp_stream).await {
                             Ok(addr) => {
                                 log::debug!("update_tcp_public_addr {cur_index},{stun} {addr}");
-                                tunnel_tx.node_context().update_tcp_public_addr(addr);
+                                puncher.punch_context.update_tcp_public_addr(addr);
                                 let mut buf = [0; 1024];
                                 loop {
                                     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -84,7 +82,9 @@ pub(crate) async fn query_tcp_public_addr_loop(
                                         Ok(_) => {}
                                         Err(e) => {
                                             if std::io::ErrorKind::WouldBlock != e.kind() {
-                                                log::debug!("stun tcp r close {cur_index},{stun} {addr} {e}");
+                                                log::debug!(
+                                                    "stun tcp r close {cur_index},{stun} {addr} {e}"
+                                                );
                                                 break;
                                             }
                                         }
@@ -92,7 +92,9 @@ pub(crate) async fn query_tcp_public_addr_loop(
                                 }
                             }
                             Err(e) => {
-                                log::debug!("query_tcp_public_addr_loop stun_tcp_read {e:?},server={stun:?}",);
+                                log::debug!(
+                                    "query_tcp_public_addr_loop stun_tcp_read {e:?},server={stun:?}",
+                                );
                             }
                         }
                     }
@@ -106,10 +108,8 @@ pub(crate) async fn query_tcp_public_addr_loop(
     }
 }
 
-pub(crate) async fn query_udp_public_addr_loop(
-    tunnel_tx: TunnelRouter,
-    udp_stun_servers: Vec<String>,
-) {
+pub(crate) async fn query_udp_public_addr_loop(puncher: Puncher) {
+    let udp_stun_servers = puncher.punch_context.udp_stun_servers.clone();
     log::debug!("udp_stun_servers = {udp_stun_servers:?}");
     let udp_len = udp_stun_servers.len();
     if udp_len == 0 {
@@ -124,7 +124,7 @@ pub(crate) async fn query_udp_public_addr_loop(
             match stun.to_socket_addrs() {
                 Ok(mut addr) => {
                     if let Some(addr) = addr.next() {
-                        if let Some(w) = tunnel_tx.socket_manager.udp_socket_manager_as_ref() {
+                        if let Some(w) = puncher.socket_manager.udp_socket_manager_as_ref() {
                             if let Err(e) = w.detect_pub_addrs(&stun_request, addr).await {
                                 log::debug!("detect_pub_addrs {e:?} {addr:?}");
                             }

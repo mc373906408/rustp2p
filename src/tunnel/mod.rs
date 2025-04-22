@@ -1,4 +1,4 @@
-use crate::config::TunnelManagerConfig;
+use crate::config::Config;
 use crate::extend::byte_pool::{Block, BufferPool};
 use crate::protocol::broadcast::RangeBroadcastPacket;
 use crate::protocol::id_route::IDRouteReplyPacket;
@@ -33,12 +33,12 @@ mod node_context;
 
 mod send_packet;
 
-pub(crate) struct TunnelManager {
+pub(crate) struct TunnelDispatcher {
     send_buffer_size: usize,
     recv_buffer_size: usize,
     node_context: NodeContext,
     route_table: RouteTable<NodeID>,
-    tunnel_factory: rust_p2p_core::tunnel::UnifiedTunnelFactory,
+    tunnel_dispatcher: rust_p2p_core::tunnel::TunnelDispatcher,
     shutdown_manager: ShutdownManager<()>,
     active_punch_sender: Sender<(NodeID, PunchConsultInfo)>,
     passive_punch_sender: Sender<(NodeID, PunchConsultInfo)>,
@@ -46,11 +46,11 @@ pub(crate) struct TunnelManager {
     recycle_buf: Option<RecycleBuf>,
 }
 
-impl TunnelManager {
-    pub async fn new(config: TunnelManagerConfig) -> io::Result<TunnelManager> {
+impl TunnelDispatcher {
+    pub async fn new(config: Config) -> io::Result<TunnelDispatcher> {
         Box::pin(Self::new_impl(config)).await
     }
-    pub(crate) async fn new_impl(mut config: TunnelManagerConfig) -> io::Result<TunnelManager> {
+    pub(crate) async fn new_impl(mut config: Config) -> io::Result<TunnelDispatcher> {
         let load_balance = config.load_balance;
         let major_socket_count = config.major_socket_count;
         let send_buffer_size = config.send_buffer_size;
@@ -143,7 +143,7 @@ impl TunnelManager {
             node_context.set_mapping_addrs(addrs);
         }
         let shutdown_manager = ShutdownManager::<()>::new();
-        let tunnel_tx = TunnelHubSender {
+        let tunnel_tx = TunnelRouter {
             route_table: route_table.clone(),
             send_buffer_size,
             node_context: node_context.clone(),
@@ -180,7 +180,7 @@ impl TunnelManager {
             send_buffer_size,
             recv_buffer_size,
             node_context,
-            tunnel_factory,
+            tunnel_dispatcher: tunnel_factory,
             shutdown_manager,
             active_punch_sender,
             passive_punch_sender,
@@ -188,32 +188,32 @@ impl TunnelManager {
             recycle_buf,
         })
     }
-    pub(crate) fn tunnel_send_hub(&self) -> TunnelHubSender {
-        TunnelHubSender {
+    pub(crate) fn tunnel_router(&self) -> TunnelRouter {
+        TunnelRouter {
             send_buffer_size: self.send_buffer_size,
             node_context: self.node_context.clone(),
             route_table: self.route_table.clone(),
-            socket_manager: self.tunnel_factory.socket_manager(),
+            socket_manager: self.tunnel_dispatcher.socket_manager(),
             shutdown_manager: self.shutdown_manager.clone(),
             recycle_buf: self.recycle_buf.clone(),
         }
     }
 }
 
-impl Drop for TunnelManager {
+impl Drop for TunnelDispatcher {
     fn drop(&mut self) {
         _ = self.shutdown_manager.trigger_shutdown(());
     }
 }
 
-impl TunnelManager {
+impl TunnelDispatcher {
     pub(crate) async fn dispatch(&mut self) -> io::Result<Tunnel> {
         if self.shutdown_manager.is_shutdown_triggered() {
             return Err(io::Error::new(io::ErrorKind::Other, "shutdown"));
         }
         let Ok(tunnel) = self
             .shutdown_manager
-            .wrap_cancel(self.tunnel_factory.dispatch())
+            .wrap_cancel(self.tunnel_dispatcher.dispatch())
             .await
         else {
             return Err(io::Error::new(io::ErrorKind::Other, "shutdown"));
@@ -226,7 +226,7 @@ impl TunnelManager {
             shutdown_manager: self.shutdown_manager.clone(),
             node_context: self.node_context.clone(),
             tunnel,
-            tunnel_transmit: self.tunnel_send_hub(),
+            tunnel_transmit: self.tunnel_router(),
             route_table: self.route_table.clone(),
             active_punch_sender: self.active_punch_sender.clone(),
             passive_punch_sender: self.passive_punch_sender.clone(),
@@ -239,16 +239,16 @@ impl TunnelManager {
     }
 }
 
-pub struct TunnelHubSender {
+pub struct TunnelRouter {
     send_buffer_size: usize,
     node_context: NodeContext,
     route_table: RouteTable<NodeID>,
-    socket_manager: rust_p2p_core::tunnel::UnifiedSocketManager,
+    socket_manager: rust_p2p_core::tunnel::SocketManager,
     shutdown_manager: ShutdownManager<()>,
     recycle_buf: Option<RecycleBuf>,
 }
 
-impl TunnelHubSender {
+impl TunnelRouter {
     pub fn node_context(&self) -> &NodeContext {
         &self.node_context
     }
@@ -648,7 +648,7 @@ impl TunnelHubSender {
         unsafe {
             send_packet.set_payload_len(payload_size);
         }
-        let mut packet = NetPacket::unchecked(send_packet.buf_mut());
+        let mut packet = NetPacket::new_unchecked(send_packet.buf_mut());
         packet.set_high_flag();
         packet.set_protocol(protocol_type);
         packet.set_ttl(15);
@@ -669,8 +669,8 @@ impl TunnelHubSender {
 pub(crate) struct Tunnel {
     shutdown_manager: ShutdownManager<()>,
     node_context: NodeContext,
-    tunnel: rust_p2p_core::tunnel::UnifiedTunnel,
-    tunnel_transmit: TunnelHubSender,
+    tunnel: rust_p2p_core::tunnel::Tunnel,
+    tunnel_transmit: TunnelRouter,
     route_table: RouteTable<NodeID>,
     active_punch_sender: Sender<(NodeID, PunchConsultInfo)>,
     passive_punch_sender: Sender<(NodeID, PunchConsultInfo)>,
@@ -1192,9 +1192,7 @@ impl Tunnel {
                         io::Error::new(io::ErrorKind::Other, format!("RmpDecodeError: {e:?}"))
                     })?;
                 log::debug!("PunchConsultRequest {:?}", punch_info);
-                let consult_info = self
-                    .node_context
-                    .gen_punch_info(punch_info.peer_nat_info.seq);
+                let consult_info = self.node_context.gen_punch_info();
                 let data = rmp_serde::to_vec(&consult_info).map_err(|e| {
                     io::Error::new(io::ErrorKind::Other, format!("RmpEncodeError: {e:?}"))
                 })?;
@@ -1348,7 +1346,7 @@ impl Tunnel {
 }
 
 async fn id_route_reply(
-    tunnel_tx: TunnelHubSender,
+    tunnel_tx: TunnelRouter,
     other_route_table: Arc<DashMap<GroupCode, RouteTable<NodeID>>>,
     route_key: RouteKey,
     self_group_code: GroupCode,
@@ -1398,18 +1396,22 @@ pub struct RecvResult<'a> {
 }
 
 impl<'a> RecvResult<'a> {
-    pub fn new(buf: &'a mut [u8], route_key: RouteKey) -> Self {
+    pub(crate) fn new(buf: &'a mut [u8], route_key: RouteKey) -> Self {
         Self { buf, route_key }
     }
+
     pub fn buf(&mut self) -> &mut [u8] {
         self.buf
     }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.route_key.addr()
     }
+
     pub fn net_packet(&self) -> io::Result<NetPacket<&[u8]>> {
         NetPacket::new(self.buf)
     }
+
     pub fn net_packet_mut(&mut self) -> io::Result<NetPacket<&mut [u8]>> {
         NetPacket::new(self.buf)
     }
@@ -1541,7 +1543,7 @@ pub(crate) enum RecvError {
 
 #[derive(thiserror::Error, Debug)]
 #[error("handle error {route_key:?},err={err:?}")]
-pub struct HandleError {
+pub(crate) struct HandleError {
     route_key: RouteKey,
     err: io::Error,
 }
@@ -1550,10 +1552,12 @@ impl HandleError {
     pub(crate) fn new(route_key: RouteKey, err: io::Error) -> Self {
         Self { route_key, err }
     }
-    pub fn addr(&self) -> SocketAddr {
+    #[allow(dead_code)]
+    pub(crate) fn addr(&self) -> SocketAddr {
         self.route_key.addr()
     }
-    pub fn err(&self) -> &io::Error {
+    #[allow(dead_code)]
+    pub(crate) fn err(&self) -> &io::Error {
         &self.err
     }
 }

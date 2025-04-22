@@ -14,7 +14,7 @@ use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
-use rust_p2p_core::punch::{PunchConsultInfo, PunchModelBox};
+use rust_p2p_core::punch::{PunchConsultInfo, PunchPolicySet};
 use rust_p2p_core::route::route_table::RouteTable;
 use rust_p2p_core::route::Index;
 use rust_p2p_core::socket::LocalInterface;
@@ -226,10 +226,10 @@ impl NodeContext {
     pub(crate) fn punch_info(&self) -> &Arc<RwLock<NodePunchInfo>> {
         &self.punch_info
     }
-    pub(crate) fn gen_punch_info(&self, seq: u32) -> PunchConsultInfo {
-        self.punch_info.read().punch_consult_info(seq)
+    pub(crate) fn gen_punch_info(&self) -> PunchConsultInfo {
+        self.punch_info.read().punch_consult_info()
     }
-    pub(crate) fn punch_model_box(&self) -> PunchModelBox {
+    pub(crate) fn punch_model_box(&self) -> PunchPolicySet {
         self.punch_info.read().punch_model_box.clone()
     }
     pub fn set_mapping_addrs(&self, mapping_addrs: Vec<NodeAddress>) {
