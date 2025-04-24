@@ -18,6 +18,13 @@ export OPENSSL_DIR=$ROOT_DIR/$OPENSSL_DIR
 export OPENSSL_INCLUDE_DIR=$OPENSSL_DIR/include
 export OPENSSL_LIB_DIR=$OPENSSL_DIR/lib
 
+# 设置系统库路径
+export LD_LIBRARY_PATH=$OPENSSL_LIB_DIR:$LD_LIBRARY_PATH
+
+# 创建符号链接
+ln -sf $OPENSSL_LIB_DIR/libssl.so.1.1 $OPENSSL_LIB_DIR/libssl.so
+ln -sf $OPENSSL_LIB_DIR/libcrypto.so.1.1 $OPENSSL_LIB_DIR/libcrypto.so
+
 # 构建Rust库
 echo -e "${YELLOW}编译Rust库(x64版本)...${NC}"
 cargo build --release --features "ffi use-kcp aes-gcm-openssl chacha20-poly1305-openssl"
@@ -44,17 +51,18 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DRUSTP2P_INCLUDE_DIR=$ROOT_DIR/include
 cmake --build .
 
 # 检查构建结果
-if [ -f "p2p_test" ]; then
-    # 设置p2p_test的RPATH
-    echo -e "${YELLOW}设置p2p_test的RPATH...${NC}"
-    patchelf --set-rpath '$ORIGIN' p2p_test || echo -e "${YELLOW}警告: 无法设置RPATH，可能需要手动设置LD_LIBRARY_PATH${NC}"
+if [ -f "tcp_test" ]; then
+    # 设置tcp_test的RPATH
+    echo -e "${YELLOW}设置tcp_test的RPATH...${NC}"
+    patchelf --set-rpath '$ORIGIN' tcp_test || echo -e "${YELLOW}警告: 无法设置RPATH，可能需要手动设置LD_LIBRARY_PATH${NC}"
 
     cd $ROOT_DIR
-    echo -e "${GREEN}构建成功! 可执行文件位于: examples/c_examples/build/p2p_test${NC}"
+    echo -e "${GREEN}构建成功! 可执行文件位于: examples/c_examples/build/${NC}"
+    echo -e "${GREEN}  - tcp_test${NC}"
     echo -e "${GREEN}已启用特性: ffi use-kcp aes-gcm-openssl chacha20-poly1305-openssl${NC}"
-    echo -e "${GREEN}使用方法: cd examples/c_examples/build && ./p2p_test <本地IP> <端口> <组代码> <模式> [对等节点地址]${NC}"
+    echo -e "${GREEN}使用方法: cd examples/c_examples/build && ./tcp_test <本地IP> <端口> <组代码> <模式> [对等节点地址]${NC}"
 else
     cd $ROOT_DIR
-    echo -e "${RED}构建失败!${NC}"
+    echo -e "${RED}构建失败! 未找到 tcp_test。${NC}"
     exit 1
 fi

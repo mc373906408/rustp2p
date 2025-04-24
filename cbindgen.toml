@@ -10,7 +10,7 @@ style = "Type"
 
 [export]
 prefix = ""
-include = ["EndpointHandle", "MessageCallback"]
+include = ["EndpointHandle", "MessageCallback", "CipherType", "NatTypeC", "TransportType"]
 
 [parse]
 parse_deps = true
@@ -30,6 +30,12 @@ prefix_with_name = true
 [fn]
 args = "Vertical"
 rename_args = "CamelCase"
+
+[const]
+allow_static_const = true
+
+[export.rename]
+"usize" = "size_t"
 
 [macro_expansion]
 bitflags = true
