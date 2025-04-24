@@ -262,20 +262,22 @@ pub extern "C" fn rustp2p_add_peer(handle: EndpointHandle, peer_address: *const 
     }
 }
 
-/// 发送消息
+/// 发送消息（合并同步和异步功能）
 ///
 /// @param handle EndpointHandle
 /// @param peer_ip 对等节点IP地址字符串
 /// @param data 消息数据
 /// @param data_len 消息长度
+/// @param reliable 是否使用可靠传输 (1=同步/可靠, 0=异步/不可靠)
 /// @param protocol_used 用来存储使用的协议（TCP/UDP），0表示TCP，1表示UDP，2表示未知
 /// @return 成功返回true，失败返回false
 #[no_mangle]
-pub extern "C" fn rustp2p_send_message(
+pub extern "C" fn rustp2p_send(
     handle: EndpointHandle,
     peer_ip: *const c_char,
     data: *const u8,
     data_len: size_t,
+    reliable: i32,
     protocol_used: *mut i32,
 ) -> bool {
     if handle.is_null() || peer_ip.is_null() || data.is_null() || data_len == 0 {
@@ -303,37 +305,6 @@ pub extern "C" fn rustp2p_send_message(
     // 将C指针转换为Rust切片
     let buffer = unsafe { std::slice::from_raw_parts(data, data_len) };
 
-    // 发送前尝试触发路由发现
-    let endpoint_clone = wrapper.endpoint.clone();
-    let _ = wrapper.runtime.block_on(async move {
-        let _ = endpoint_clone.send_to(b"ping", node_id).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    });
-
-    // 尝试多次发送消息
-    let mut success = false;
-    let endpoint_clone_send = wrapper.endpoint.clone();
-    
-    for _i in 0..3 {
-        // 发送消息
-        let result = wrapper
-            .runtime
-            .block_on(async {
-                 endpoint_clone_send.send_to(buffer, node_id).await
-            });
-
-        if let Ok(_) = result {
-            success = true;
-            break;
-        } else {
-            // 发送失败，尝试再次触发路由发现
-            let _ = wrapper.runtime.block_on(async {
-                let _ = wrapper.endpoint.send_to(b"ping", node_id).await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            });
-        }
-    }
-
     // 设置协议为未知（简化协议检测）
     if !protocol_used.is_null() {
         unsafe {
@@ -341,66 +312,52 @@ pub extern "C" fn rustp2p_send_message(
         }
     }
 
-    success
-}
+    if reliable > 0 {
+        // 可靠传输：同步发送
+        // 删除发送前的路由发现代码
+        
+        // 尝试发送消息
+        let mut success = false;
+        let endpoint_clone_send = wrapper.endpoint.clone();
+        
+        for _i in 0..3 {
+            // 发送消息
+            let result = wrapper
+                .runtime
+                .block_on(async {
+                     endpoint_clone_send.send_to(buffer, node_id).await
+                });
 
-/// 异步发送消息
-#[no_mangle]
-pub extern "C" fn rustp2p_send_message_async(
-    handle: EndpointHandle,
-    peer_ip: *const c_char,
-    data: *const u8,
-    data_len: size_t,
-    protocol_used: *mut i32,
-) -> bool {
-    if handle.is_null() || peer_ip.is_null() || data.is_null() || data_len == 0 {
-        return false;
-    }
-
-    // 设置协议为未知
-    if !protocol_used.is_null() {
-        unsafe {
-            *protocol_used = TransportProtocolC::Unknown as i32;
-        }
-    }
-
-    let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
-
-    // 解析IP地址字符串
-    let peer_ip_str = unsafe {
-        match CStr::from_ptr(peer_ip).to_str() {
-            Ok(s) => s,
-            Err(_) => return false,
-        }
-    };
-
-    // 解析为Ipv4Addr
-    let peer_id = match Ipv4Addr::from_str(peer_ip_str) {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-    
-    let node_id = NodeID::from(peer_id);
-    
-    // 复制数据，因为异步任务可能在原始数据被释放后才执行
-    let data_vec: Vec<u8> = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
-
-    let endpoint_clone = wrapper.endpoint.clone();
-    let runtime_handle = wrapper.runtime.handle().clone();
-
-    // 创建异步发送任务
-    runtime_handle.spawn(async move {
-        match endpoint_clone.send_to(data_vec.as_slice(), node_id).await {
-            Ok(_) => {
-                // 发送成功，无需记录具体协议
-            }
-            Err(e) => {
-                log::error!("[FFI Async] Failed to send message to {:?}: {:?}", node_id, e);
+            if let Ok(_) = result {
+                success = true;
+                break;
+            } else {
+                // 发送失败，稍等片刻后重试
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-    });
+        success
+    } else {
+        // 不可靠传输：异步发送
+        // 复制数据，因为异步任务可能在原始数据被释放后才执行
+        let data_vec: Vec<u8> = buffer.to_vec();
 
-    true
+        let endpoint_clone = wrapper.endpoint.clone();
+        let runtime_handle = wrapper.runtime.handle().clone();
+
+        // 创建异步发送任务
+        runtime_handle.spawn(async move {
+            match endpoint_clone.send_to(data_vec.as_slice(), node_id).await {
+                Ok(_) => {
+                    // 发送成功
+                }
+                Err(e) => {
+                    log::error!("[FFI Async] Failed to send message to {:?}: {:?}", node_id, e);
+                }
+            }
+        });
+        true // 异步发送总是返回true，因为只是提交了任务
+    }
 }
 
 /// 启动消息接收循环
@@ -793,103 +750,6 @@ pub extern "C" fn rustp2p_close_kcp_stream(handle: KcpStreamHandle) {
             let _boxed = Box::from_raw(handle as *mut KcpStreamWrapper);
         }
     }
-}
-
-/// 触发路由发现
-///
-/// @param handle EndpointHandle
-/// @param target_ip 目标节点IP地址字符串
-/// @param attempts 尝试次数
-/// @return 成功返回true，失败返回false
-#[no_mangle]
-pub extern "C" fn rustp2p_trigger_route_discovery(
-    handle: EndpointHandle,
-    target_ip: *const c_char,
-    attempts: u32,
-) -> bool {
-    if handle.is_null() || target_ip.is_null() {
-        return false;
-    }
-
-    let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
-
-    // 解析IP地址字符串
-    let target_ip_str = unsafe {
-        match CStr::from_ptr(target_ip).to_str() {
-            Ok(s) => s,
-            Err(_) => return false,
-        }
-    };
-
-    // 解析为Ipv4Addr
-    let target_id = match Ipv4Addr::from_str(target_ip_str) {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-    
-    let node_id = NodeID::from(target_id);
-
-    println!(
-        "[FFI] rustp2p_trigger_route_discovery: Triggering route discovery to {}",
-        target_id
-    );
-
-    // 使用block_on执行异步发送
-    // 尝试指定次数，但简化代码
-    let mut success = false;
-
-    // 至少尝试一次
-    let attempts = if attempts == 0 { 1 } else { attempts };
-
-    // 尝试使用不同的消息进行路由发现
-    let discovery_messages = [
-        b"route_discovery".as_slice(),
-        b"ping".as_slice(),
-        b"hello".as_slice(),
-    ];
-
-    let endpoint_clone = wrapper.endpoint.clone();
-    for i in 0..attempts {
-        // 选择不同的消息
-        let msg = discovery_messages[i as usize % discovery_messages.len()];
-
-        println!(
-            "[FFI] rustp2p_trigger_route_discovery: Attempt {} with message {:?}",
-            i + 1,
-            String::from_utf8_lossy(msg)
-        );
-
-        let result = wrapper
-            .runtime
-            .block_on(async { endpoint_clone.send_to(msg, node_id).await });
-
-        if result.is_ok() {
-            println!("[FFI] rustp2p_trigger_route_discovery: Message sent successfully");
-            success = true;
-
-            let endpoint_clone_inner = wrapper.endpoint.clone();
-            // 发送多个消息以确保路由建立
-            for _ in 0..2 {
-                let _ = wrapper.runtime.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    endpoint_clone_inner.send_to(msg, node_id).await
-                });
-            }
-
-            break;
-        } else {
-            println!("[FFI] rustp2p_trigger_route_discovery: Message failed to send");
-            // 等待一小段时间再尝试
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-    }
-
-    // 如果成功发送了消息，等待一小段时间让路由建立
-    if success {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-
-    success
 }
 
 /// 创建KCP监听器

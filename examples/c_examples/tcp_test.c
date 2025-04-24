@@ -67,7 +67,11 @@ void message_callback(const uint8_t *source_ip_ptr, const uint8_t *message_ptr, 
                 // Use the async send function for forwarding
                 printf("[Server] 提交异步转发任务给 %s...\n", target_ip_str); // Log submission
                 int32_t protocol_used = -1;
-                if (!rustp2p_send_message_async(endpoint_handle, target_ip_str, (const uint8_t *)forward_message, strlen(forward_message), &protocol_used))
+                if (!rustp2p_send(endpoint_handle, target_ip_str,
+                                  (const uint8_t *)forward_message,
+                                  strlen(forward_message),
+                                  0, // 使用不可靠传输（异步）
+                                  &protocol_used))
                 {
                     // Log only if spawning the task failed
                     fprintf(stderr, "[Server] 提交异步转发任务失败 for %s (无法生成任务)\n", target_ip_str);
@@ -254,6 +258,58 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // --- 客户端模式：发送在线检测消息给服务端 ---
+    if (!is_server_mode && server_ip_host != 0)
+    {
+        printf("发送在线检测消息给服务器...\n");
+
+        // 将服务器IP转换为字符串
+        char server_ip_str[INET_ADDRSTRLEN];
+        struct in_addr addr;
+        addr.s_addr = htonl(server_ip_host);
+        inet_ntop(AF_INET, &addr, server_ip_str, INET_ADDRSTRLEN);
+
+        // 准备测试消息
+        const char *test_message = "ONLINE_CHECK";
+
+        // 多次尝试发送，给予足够时间建立连接
+        int connected = 0;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            printf("尝试连接服务器 (第 %d 次)...\n", attempt + 1);
+
+            // 使用可靠传输发送消息
+            int32_t protocol_used = -1;
+            if (rustp2p_send(endpoint_handle, server_ip_str,
+                             (const uint8_t *)test_message,
+                             strlen(test_message),
+                             1, // 使用可靠传输
+                             &protocol_used))
+            {
+                connected = 1;
+                printf("成功连接到服务器！\n");
+                break;
+            }
+
+            // 发送失败，等待一段时间后重试
+            if (attempt < 2)
+            {
+                printf("连接暂时失败，等待重试...\n");
+                sleep(2); // 等待2秒再尝试
+            }
+        }
+
+        if (!connected)
+        {
+            fprintf(stderr, "警告: 无法连接到服务器，请确认服务器是否在线\n");
+        }
+        else
+        {
+            // 等待短暂时间以便接收到响应
+            sleep(1);
+        }
+    }
+
     // --- Main Input Loop (Client Mode Only) ---
     if (!is_server_mode)
     {
@@ -262,7 +318,11 @@ int main(int argc, char *argv[])
         struct timeval tv;
         int select_result;
 
-        printf("客户端准备就绪. 输入 '<目标IP>:<消息>' 直接发送消息给目标IP，或按 Ctrl+C 退出。\n> ");
+        printf("客户端准备就绪.\n");
+        printf("输入格式: '<目标IP>:<消息>' 直接发送消息，默认使用可靠传输\n");
+        printf("          'r:<目标IP>:<消息>' 使用可靠传输发送消息\n");
+        printf("          'u:<目标IP>:<消息>' 使用不可靠传输发送消息\n");
+        printf("按 Ctrl+C 退出\n> ");
         fflush(stdout);
 
         while (keep_running)
@@ -329,23 +389,38 @@ int main(int argc, char *argv[])
                         continue;
                     }
 
-                    char *colon_ptr = strchr(input_buffer, ':');
-                    if (colon_ptr == NULL || colon_ptr == input_buffer || *(colon_ptr + 1) == '\0')
+                    // 检查是否有可靠性前缀
+                    int reliable = 1; // 默认使用可靠传输
+                    char *content_start = input_buffer;
+
+                    if (strncmp(input_buffer, "r:", 2) == 0)
                     {
-                        fprintf(stderr, "格式错误: 请输入 '<目标IP>:<消息>'\n");
+                        reliable = 1; // 可靠传输
+                        content_start = input_buffer + 2;
+                    }
+                    else if (strncmp(input_buffer, "u:", 2) == 0)
+                    {
+                        reliable = 0; // 不可靠传输
+                        content_start = input_buffer + 2;
+                    }
+
+                    char *colon_ptr = strchr(content_start, ':');
+                    if (colon_ptr == NULL || colon_ptr == content_start || *(colon_ptr + 1) == '\0')
+                    {
+                        fprintf(stderr, "格式错误: 请输入 '<目标IP>:<消息>'、'r:<目标IP>:<消息>' 或 'u:<目标IP>:<消息>'\n");
                     }
                     else
                     {
                         // 解析目标IP和消息
                         char target_ip_str[INET_ADDRSTRLEN];
-                        size_t ip_len = colon_ptr - input_buffer;
+                        size_t ip_len = colon_ptr - content_start;
                         if (ip_len >= INET_ADDRSTRLEN)
                         {
                             fprintf(stderr, "IP地址格式错误\n");
                         }
                         else
                         {
-                            strncpy(target_ip_str, input_buffer, ip_len);
+                            strncpy(target_ip_str, content_start, ip_len);
                             target_ip_str[ip_len] = '\0';
 
                             // 验证IP地址格式
@@ -364,7 +439,9 @@ int main(int argc, char *argv[])
                                 const char *message_content = colon_ptr + 1;
 
                                 // 直接发送消息给目标IP
-                                printf("正在发送消息给 %s: '%s'...\n", target_ip_str, message_content);
+                                printf("正在发送消息给 %s: '%s'...(使用%s传输)\n",
+                                       target_ip_str, message_content,
+                                       reliable ? "可靠" : "不可靠");
 
                                 // 默认添加对等节点的两种协议路径，让库自动选择最佳协议
                                 char tcp_peer_addr[64], udp_peer_addr[64];
@@ -398,10 +475,11 @@ int main(int argc, char *argv[])
 
                                 // 发送消息给目标IP
                                 int32_t protocol_used = -1;
-                                if (!rustp2p_send_message(endpoint_handle, target_ip_str,
-                                                          (const uint8_t *)message_content,
-                                                          strlen(message_content),
-                                                          &protocol_used))
+                                if (!rustp2p_send(endpoint_handle, target_ip_str,
+                                                  (const uint8_t *)message_content,
+                                                  strlen(message_content),
+                                                  reliable, // 使用用户选择的可靠性级别
+                                                  &protocol_used))
                                 {
                                     fprintf(stderr, "发送消息失败，请确认目标节点在线并检查网络连接\n");
                                 }
