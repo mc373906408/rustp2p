@@ -9,6 +9,7 @@
 #include <sys/select.h> // Added for select()
 #include <sys/time.h>   // Added for struct timeval
 #include <ctype.h>      // Added for tolower()
+#include <pthread.h>    // 添加pthread库支持
 #include "rustp2p.h"    // Assumes rustp2p.h will be regenerated with new FFI
 
 // Global state
@@ -20,6 +21,67 @@ volatile sig_atomic_t sigint_received = 0;    // Flag set by signal handler
 // Store server info when running as client
 bool is_server_mode = true; // Assume server unless -c is used
 uint32_t server_ip_host = 0;
+char server_ip_str[INET_ADDRSTRLEN] = {0}; // 存储服务器IP字符串
+volatile int server_online = -1;           // -1=未知, 0=离线, 1=在线
+
+// 在线检测线程参数结构
+typedef struct
+{
+    EndpointHandle handle;
+    const char *server_ip;
+} ServerCheckThreadParams;
+
+// 服务器在线检测线程函数
+void *server_check_thread(void *arg)
+{
+    ServerCheckThreadParams *params = (ServerCheckThreadParams *)arg;
+    EndpointHandle handle = params->handle;
+    const char *server_ip = params->server_ip;
+
+    // 删除所有打印信息，静默运行
+
+    // 准备测试消息
+    const char *test_message = "ONLINE_CHECK";
+
+    while (keep_running)
+    { // 持续运行，实时更新服务器状态
+        // 尝试发送消息测试连接
+        int connected = 0;
+        for (int attempt = 0; attempt < 3 && !connected && keep_running; attempt++)
+        {
+            // 使用可靠传输发送消息
+            int32_t protocol_used = -1;
+            if (rustp2p_send(handle, server_ip,
+                             (const uint8_t *)test_message,
+                             strlen(test_message),
+                             1, // 使用可靠传输
+                             &protocol_used))
+            {
+                connected = 1;
+                break;
+            }
+
+            // 发送失败，短暂等待后重试
+            if (attempt < 2)
+            {
+                sleep(1);
+            }
+        }
+
+        // 更新全局状态
+        server_online = connected ? 1 : 0;
+
+        // 等待一段时间再次检测
+        for (int i = 0; i < 15 && keep_running; i++)
+        {
+            sleep(1); // 总共等待约15秒再次检测
+        }
+    }
+
+    // 释放线程参数
+    free(params);
+    return NULL;
+}
 
 // --- FFI Function Declarations (matching rewritten ffi.rs) ---
 // 移除重复的函数声明，因为已经包含了rustp2p.h头文件
@@ -245,8 +307,6 @@ int main(int argc, char *argv[])
             return 1;
         }
         printf("服务器对等节点添加成功.\n");
-        printf("等待短暂时间让网络准备...\n");
-        sleep(2); // Give time for potential connection/route discovery
     }
 
     // --- Start Receiver ---
@@ -258,55 +318,32 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // --- 客户端模式：发送在线检测消息给服务端 ---
+    // --- 客户端模式：发送在线检测消息给服务端（非阻塞） ---
     if (!is_server_mode && server_ip_host != 0)
     {
-        printf("发送在线检测消息给服务器...\n");
-
         // 将服务器IP转换为字符串
-        char server_ip_str[INET_ADDRSTRLEN];
         struct in_addr addr;
         addr.s_addr = htonl(server_ip_host);
         inet_ntop(AF_INET, &addr, server_ip_str, INET_ADDRSTRLEN);
 
-        // 准备测试消息
-        const char *test_message = "ONLINE_CHECK";
+        // 删除打印信息，静默启动
 
-        // 多次尝试发送，给予足够时间建立连接
-        int connected = 0;
-        for (int attempt = 0; attempt < 3; attempt++)
+        // 创建线程参数
+        ServerCheckThreadParams *params = malloc(sizeof(ServerCheckThreadParams));
+        params->handle = endpoint_handle;
+        params->server_ip = server_ip_str;
+
+        // 创建检测线程
+        pthread_t check_thread;
+        if (pthread_create(&check_thread, NULL, server_check_thread, params) != 0)
         {
-            printf("尝试连接服务器 (第 %d 次)...\n", attempt + 1);
-
-            // 使用可靠传输发送消息
-            int32_t protocol_used = -1;
-            if (rustp2p_send(endpoint_handle, server_ip_str,
-                             (const uint8_t *)test_message,
-                             strlen(test_message),
-                             1, // 使用可靠传输
-                             &protocol_used))
-            {
-                connected = 1;
-                printf("成功连接到服务器！\n");
-                break;
-            }
-
-            // 发送失败，等待一段时间后重试
-            if (attempt < 2)
-            {
-                printf("连接暂时失败，等待重试...\n");
-                sleep(2); // 等待2秒再尝试
-            }
-        }
-
-        if (!connected)
-        {
-            fprintf(stderr, "警告: 无法连接到服务器，请确认服务器是否在线\n");
+            fprintf(stderr, "错误: 无法创建服务器检测线程\n");
+            free(params);
         }
         else
         {
-            // 等待短暂时间以便接收到响应
-            sleep(1);
+            // 分离线程使其自动释放资源
+            pthread_detach(check_thread);
         }
     }
 
@@ -322,6 +359,7 @@ int main(int argc, char *argv[])
         printf("输入格式: '<目标IP>:<消息>' 直接发送消息，默认使用可靠传输\n");
         printf("          'r:<目标IP>:<消息>' 使用可靠传输发送消息\n");
         printf("          'u:<目标IP>:<消息>' 使用不可靠传输发送消息\n");
+        printf("          'status' 查询服务器在线状态\n");
         printf("按 Ctrl+C 退出\n> ");
         fflush(stdout);
 
@@ -384,6 +422,26 @@ int main(int argc, char *argv[])
 
                     if (strlen(input_buffer) == 0)
                     {
+                        printf("> ");
+                        fflush(stdout);
+                        continue;
+                    }
+
+                    // 检查是否是状态查询命令
+                    if (strcmp(input_buffer, "status") == 0)
+                    {
+                        if (server_online == -1)
+                        {
+                            printf("服务器在线状态: 正在检测中...\n");
+                        }
+                        else if (server_online == 1)
+                        {
+                            printf("服务器在线状态: 在线\n");
+                        }
+                        else
+                        {
+                            printf("服务器在线状态: 离线\n");
+                        }
                         printf("> ");
                         fflush(stdout);
                         continue;
