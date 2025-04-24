@@ -23,42 +23,15 @@ uint32_t server_ip_host = 0;
 
 // --- FFI Function Declarations (matching rewritten ffi.rs) ---
 // Note: These might slightly differ from the generated header, but represent the expected functions.
-extern EndpointHandle rustp2p_init(uint32_t node_ip, uint16_t tcp_port, uint16_t udp_port, uint32_t group_code, const char *password, int32_t cipher_type, int32_t use_kcp);
+extern EndpointHandle rustp2p_init(const char *node_ip, uint16_t tcp_port, uint16_t udp_port, uint32_t group_code, const char *password, int32_t cipher_type, int32_t use_kcp);
 extern bool rustp2p_add_peer(EndpointHandle handle, const char *peer_address);
 extern bool rustp2p_start_receiver(EndpointHandle handle, MessageCallback callback);
-extern bool rustp2p_send_message(EndpointHandle handle, uint32_t peer_ip_host, const uint8_t *data, size_t data_len, int32_t *protocol_used);
-extern bool rustp2p_send_message_async(EndpointHandle handle, uint32_t peer_ip_host, const uint8_t *data, size_t data_len, int32_t *protocol_used);
+extern bool rustp2p_send_message(EndpointHandle handle, const char *peer_ip, const uint8_t *data, size_t data_len, int32_t *protocol_used);
+extern bool rustp2p_send_message_async(EndpointHandle handle, const char *peer_ip, const uint8_t *data, size_t data_len, int32_t *protocol_used);
 extern bool rustp2p_cleanup(EndpointHandle handle, uint64_t timeout_ms);
-// extern bool rustp2p_trigger_route_discovery(EndpointHandle handle, uint32_t target_ip_host, uint32_t attempts); // Removed for simplicity
+extern bool rustp2p_trigger_route_discovery(EndpointHandle handle, const char *target_ip, uint32_t attempts);
 
 // --- Helper Functions ---
-
-// Convert IP string to host byte order u32
-uint32_t ip_str_to_u32(const char *ip_str)
-{
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip_str, &addr) == 1)
-    {
-        // inet_pton gives network byte order, convert to host for internal use
-        return ntohl(addr.s_addr);
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-// Convert host byte order u32 to IP string
-void u32_to_ip_str(uint32_t ip_host, char *ip_str, size_t str_len)
-{
-    struct in_addr addr;
-    addr.s_addr = htonl(ip_host); // Convert back to network order for inet_ntop
-    if (inet_ntop(AF_INET, &addr, ip_str, str_len) == NULL)
-    {
-        strncpy(ip_str, "Invalid IP", str_len - 1);
-        ip_str[str_len - 1] = '\0';
-    }
-}
 
 // --- Callback and Signal Handler ---
 
@@ -88,7 +61,7 @@ void message_callback(const uint8_t *source_ip_ptr, const uint8_t *message_ptr, 
             const char *target_ip_str = received_message;
             const char *actual_content = separator + 1;
 
-            uint32_t target_ip_host = ip_str_to_u32(target_ip_str);
+            uint32_t target_ip_host = server_ip_host;
 
             if (target_ip_host != 0)
             { // Validate target IP
@@ -101,7 +74,7 @@ void message_callback(const uint8_t *source_ip_ptr, const uint8_t *message_ptr, 
                 // Use the async send function for forwarding
                 printf("[Server] 提交异步转发任务给 %s...\n", target_ip_str); // Log submission
                 int32_t protocol_used = -1;
-                if (!rustp2p_send_message_async(endpoint_handle, target_ip_host, (const uint8_t *)forward_message, strlen(forward_message), &protocol_used))
+                if (!rustp2p_send_message_async(endpoint_handle, target_ip_str, (const uint8_t *)forward_message, strlen(forward_message), &protocol_used))
                 {
                     // Log only if spawning the task failed
                     fprintf(stderr, "[Server] 提交异步转发任务失败 for %s (无法生成任务)\n", target_ip_str);
@@ -189,7 +162,17 @@ int main(int argc, char *argv[])
             {
                 strncpy(server_ip_part, server_address_str, len);
                 server_ip_part[len] = '\0';
-                server_ip_host = ip_str_to_u32(server_ip_part);
+
+                // 将服务器IP地址直接存储，不需要转换为整数
+                struct in_addr addr;
+                if (inet_pton(AF_INET, server_ip_part, &addr) == 1)
+                {
+                    server_ip_host = ntohl(addr.s_addr);
+                }
+                else
+                {
+                    server_ip_host = 0;
+                }
             }
         }
         else
@@ -197,7 +180,17 @@ int main(int argc, char *argv[])
             // Assume the whole string is an IP if no colon
             strncpy(server_ip_part, server_address_str, sizeof(server_ip_part) - 1);
             server_ip_part[sizeof(server_ip_part) - 1] = '\0';
-            server_ip_host = ip_str_to_u32(server_ip_part);
+
+            // 将服务器IP地址直接存储，不需要转换为整数
+            struct in_addr addr;
+            if (inet_pton(AF_INET, server_ip_part, &addr) == 1)
+            {
+                server_ip_host = ntohl(addr.s_addr);
+            }
+            else
+            {
+                server_ip_host = 0;
+            }
         }
 
         if (server_ip_host == 0)
@@ -214,8 +207,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    uint32_t local_ip_host = ip_str_to_u32(local_ip_str);
-    if (local_ip_host == 0)
+    // 检查本地IP格式是否有效
+    struct in_addr addr;
+    if (inet_pton(AF_INET, local_ip_str, &addr) != 1)
     {
         fprintf(stderr, "错误: 无效的本地IP地址: %s\n", local_ip_str);
         return 1;
@@ -224,7 +218,7 @@ int main(int argc, char *argv[])
     // --- Initialization ---
     printf("初始化 RustP2P (TCP 端口: %u, UDP 端口: %u, 无加密)...\n", local_tcp_port, local_udp_port);
     endpoint_handle = rustp2p_init(
-        local_ip_host,
+        local_ip_str,
         local_tcp_port,
         local_udp_port,
         group_code,
@@ -361,13 +355,18 @@ int main(int argc, char *argv[])
                             strncpy(target_ip_str, input_buffer, ip_len);
                             target_ip_str[ip_len] = '\0';
 
-                            uint32_t target_ip_host = ip_str_to_u32(target_ip_str);
-                            if (target_ip_host == 0)
+                            // 验证IP地址格式
+                            struct in_addr addr;
+                            uint32_t target_ip_host = 0;
+                            if (inet_pton(AF_INET, target_ip_str, &addr) != 1)
                             {
                                 fprintf(stderr, "无效的目标IP地址: %s\n", target_ip_str);
                             }
                             else
                             {
+                                // 获取网络字节序的IP整数值
+                                target_ip_host = ntohl(addr.s_addr);
+
                                 // 获取消息内容
                                 const char *message_content = colon_ptr + 1;
 
@@ -406,7 +405,7 @@ int main(int argc, char *argv[])
 
                                 // 发送消息给目标IP
                                 int32_t protocol_used = -1;
-                                if (!rustp2p_send_message(endpoint_handle, target_ip_host,
+                                if (!rustp2p_send_message(endpoint_handle, target_ip_str,
                                                           (const uint8_t *)message_content,
                                                           strlen(message_content),
                                                           &protocol_used))

@@ -96,7 +96,7 @@ struct KcpListenerWrapper {
 
 /// 初始化函数
 ///
-/// @param node_ip IPv4地址表示为32位无符号整数（网络字节序）
+/// @param node_ip IPv4地址字符串
 /// @param tcp_port TCP端口
 /// @param udp_port UDP端口
 /// @param group_code 组代码
@@ -106,7 +106,7 @@ struct KcpListenerWrapper {
 /// @return 成功返回EndpointHandle，失败返回NULL
 #[no_mangle]
 pub extern "C" fn rustp2p_init(
-    node_ip: u32,            // IPv4地址表示为32位无符号整数（网络字节序）
+    node_ip: *const c_char,    // IPv4地址字符串
     tcp_port: u16,           // TCP端口
     udp_port: u16,           // UDP端口
     group_code: u32,         // 组代码
@@ -115,9 +115,23 @@ pub extern "C" fn rustp2p_init(
     use_kcp: i32,            // 是否启用KCP传输
 ) -> EndpointHandle {
     // 安全转换
-    if password.is_null() {
+    if node_ip.is_null() || password.is_null() {
         return std::ptr::null_mut();
     }
+
+    // 解析IP地址字符串
+    let node_ip_str = unsafe {
+        match CStr::from_ptr(node_ip).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+
+    // 解析为Ipv4Addr
+    let node_id = match Ipv4Addr::from_str(node_ip_str) {
+        Ok(ip) => ip,
+        Err(_) => return std::ptr::null_mut(),
+    };
 
     let _password_str = unsafe {
         match CStr::from_ptr(password).to_str() {
@@ -125,9 +139,6 @@ pub extern "C" fn rustp2p_init(
             Err(_) => return std::ptr::null_mut(),
         }
     };
-
-    // 创建IPv4地址，已经是网络字节序（大端序）
-    let node_id = Ipv4Addr::from(node_ip.to_be_bytes());
 
     // 使用tokio运行时
     let runtime = match tokio::runtime::Runtime::new() {
@@ -254,7 +265,7 @@ pub extern "C" fn rustp2p_add_peer(handle: EndpointHandle, peer_address: *const 
 /// 发送消息
 ///
 /// @param handle EndpointHandle
-/// @param peer_ip 对等节点IP地址（网络字节序）
+/// @param peer_ip 对等节点IP地址字符串
 /// @param data 消息数据
 /// @param data_len 消息长度
 /// @param protocol_used 用来存储使用的协议（TCP/UDP），0表示TCP，1表示UDP，2表示未知
@@ -262,25 +273,31 @@ pub extern "C" fn rustp2p_add_peer(handle: EndpointHandle, peer_address: *const 
 #[no_mangle]
 pub extern "C" fn rustp2p_send_message(
     handle: EndpointHandle,
-    peer_ip: u32,
+    peer_ip: *const c_char,
     data: *const u8,
     data_len: size_t,
     protocol_used: *mut i32,
 ) -> bool {
-    if handle.is_null() || data.is_null() || data_len == 0 {
+    if handle.is_null() || peer_ip.is_null() || data.is_null() || data_len == 0 {
         return false;
     }
 
     let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
 
-    // 修复IP地址转换：从网络字节序转为主机字节序
-    let peer_id_bytes = peer_ip.to_be_bytes();
-    let peer_id = Ipv4Addr::new(
-        peer_id_bytes[0],
-        peer_id_bytes[1],
-        peer_id_bytes[2],
-        peer_id_bytes[3],
-    );
+    // 解析IP地址字符串
+    let peer_ip_str = unsafe {
+        match CStr::from_ptr(peer_ip).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+
+    // 解析为Ipv4Addr
+    let peer_id = match Ipv4Addr::from_str(peer_ip_str) {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    
     let node_id = NodeID::from(peer_id);
 
     // 将C指针转换为Rust切片
@@ -331,12 +348,12 @@ pub extern "C" fn rustp2p_send_message(
 #[no_mangle]
 pub extern "C" fn rustp2p_send_message_async(
     handle: EndpointHandle,
-    peer_ip: u32,
+    peer_ip: *const c_char,
     data: *const u8,
     data_len: size_t,
     protocol_used: *mut i32,
 ) -> bool {
-    if handle.is_null() || data.is_null() || data_len == 0 {
+    if handle.is_null() || peer_ip.is_null() || data.is_null() || data_len == 0 {
         return false;
     }
 
@@ -349,14 +366,20 @@ pub extern "C" fn rustp2p_send_message_async(
 
     let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
 
-    // 转换IP地址
-    let peer_id_bytes = peer_ip.to_be_bytes();
-    let peer_id = Ipv4Addr::new(
-        peer_id_bytes[0],
-        peer_id_bytes[1],
-        peer_id_bytes[2],
-        peer_id_bytes[3],
-    );
+    // 解析IP地址字符串
+    let peer_ip_str = unsafe {
+        match CStr::from_ptr(peer_ip).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+
+    // 解析为Ipv4Addr
+    let peer_id = match Ipv4Addr::from_str(peer_ip_str) {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    
     let node_id = NodeID::from(peer_id);
     
     // 复制数据，因为异步任务可能在原始数据被释放后才执行
@@ -775,30 +798,35 @@ pub extern "C" fn rustp2p_close_kcp_stream(handle: KcpStreamHandle) {
 /// 触发路由发现
 ///
 /// @param handle EndpointHandle
-/// @param target_ip 目标节点IP地址（网络字节序）
+/// @param target_ip 目标节点IP地址字符串
 /// @param attempts 尝试次数
 /// @return 成功返回true，失败返回false
 #[no_mangle]
 pub extern "C" fn rustp2p_trigger_route_discovery(
     handle: EndpointHandle,
-    target_ip: u32,
+    target_ip: *const c_char,
     attempts: u32,
 ) -> bool {
-    if handle.is_null() {
+    if handle.is_null() || target_ip.is_null() {
         return false;
     }
 
     let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
 
-    // 修复IP地址反转问题：C传入的是网络字节序 (big-endian)
-    // 从网络字节序（大端序）转为正确的字节数组
-    let target_id_bytes = target_ip.to_be_bytes();
-    let target_id = Ipv4Addr::new(
-        target_id_bytes[0],
-        target_id_bytes[1],
-        target_id_bytes[2],
-        target_id_bytes[3],
-    );
+    // 解析IP地址字符串
+    let target_ip_str = unsafe {
+        match CStr::from_ptr(target_ip).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+
+    // 解析为Ipv4Addr
+    let target_id = match Ipv4Addr::from_str(target_ip_str) {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    
     let node_id = NodeID::from(target_id);
 
     println!(
