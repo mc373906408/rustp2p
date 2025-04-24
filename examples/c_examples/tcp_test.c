@@ -22,14 +22,7 @@ bool is_server_mode = true; // Assume server unless -c is used
 uint32_t server_ip_host = 0;
 
 // --- FFI Function Declarations (matching rewritten ffi.rs) ---
-// Note: These might slightly differ from the generated header, but represent the expected functions.
-extern EndpointHandle rustp2p_init(const char *node_ip, uint16_t tcp_port, uint16_t udp_port, uint32_t group_code, const char *password, int32_t cipher_type, int32_t use_kcp);
-extern bool rustp2p_add_peer(EndpointHandle handle, const char *peer_address);
-extern bool rustp2p_start_receiver(EndpointHandle handle, MessageCallback callback);
-extern bool rustp2p_send_message(EndpointHandle handle, const char *peer_ip, const uint8_t *data, size_t data_len, int32_t *protocol_used);
-extern bool rustp2p_send_message_async(EndpointHandle handle, const char *peer_ip, const uint8_t *data, size_t data_len, int32_t *protocol_used);
-extern bool rustp2p_cleanup(EndpointHandle handle, uint64_t timeout_ms);
-extern bool rustp2p_trigger_route_discovery(EndpointHandle handle, const char *target_ip, uint32_t attempts);
+// 移除重复的函数声明，因为已经包含了rustp2p.h头文件
 
 // --- Helper Functions ---
 
