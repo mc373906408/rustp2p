@@ -54,8 +54,7 @@ void *server_check_thread(void *arg)
             if (rustp2p_send(handle, server_ip,
                              (const uint8_t *)test_message,
                              strlen(test_message),
-                             1, // 使用可靠传输
-                             &protocol_used))
+                             1)) // 使用可靠传输
             {
                 connected = 1;
                 break;
@@ -91,7 +90,7 @@ void *server_check_thread(void *arg)
 // --- Callback and Signal Handler ---
 
 // Message callback function - Handles both server relay and client receive
-void message_callback(const uint8_t *source_ip_ptr, const uint8_t *message_ptr, size_t message_len, TransportProtocolC protocol)
+void message_callback(const uint8_t *source_ip_ptr, const uint8_t *message_ptr, size_t message_len)
 {
     // 直接从正确顺序的IP字节构建字符串
     char source_ip_str[INET_ADDRSTRLEN] = {0};
@@ -128,12 +127,10 @@ void message_callback(const uint8_t *source_ip_ptr, const uint8_t *message_ptr, 
 
                 // Use the async send function for forwarding
                 printf("[Server] 提交异步转发任务给 %s...\n", target_ip_str); // Log submission
-                int32_t protocol_used = -1;
                 if (!rustp2p_send(endpoint_handle, target_ip_str,
                                   (const uint8_t *)forward_message,
                                   strlen(forward_message),
-                                  0, // 使用不可靠传输（异步）
-                                  &protocol_used))
+                                  0)) // 使用不可靠传输（异步）
                 {
                     // Log only if spawning the task failed
                     fprintf(stderr, "[Server] 提交异步转发任务失败 for %s (无法生成任务)\n", target_ip_str);
@@ -282,8 +279,7 @@ int main(int argc, char *argv[])
         local_udp_port,
         group_code,
         "", // No password
-        0,  // CipherType_None
-        0   // use_kcp = 0
+        0   // CipherType_None
     );
 
     if (!endpoint_handle)
@@ -532,12 +528,10 @@ int main(int argc, char *argv[])
                                 }
 
                                 // 发送消息给目标IP
-                                int32_t protocol_used = -1;
                                 if (!rustp2p_send(endpoint_handle, target_ip_str,
                                                   (const uint8_t *)message_content,
                                                   strlen(message_content),
-                                                  reliable, // 使用用户选择的可靠性级别
-                                                  &protocol_used))
+                                                  reliable)) // 使用用户选择的可靠性级别
                                 {
                                     fprintf(stderr, "发送消息失败，请确认目标节点在线并检查网络连接\n");
                                 }

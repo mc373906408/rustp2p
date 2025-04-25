@@ -1,27 +1,20 @@
+use async_shutdown::ShutdownManager;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::net::Ipv4Addr;
-use async_shutdown::ShutdownManager;
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::protocol::node_id::{GroupCode, NodeID};
 use crate::tunnel::PeerNodeAddress;
 use crate::{Builder, Endpoint};
-use std::os::raw::c_char;
 use std::ffi::c_void;
+use std::os::raw::c_char;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(feature = "use-kcp")]
-use crate::reliable::{KcpListener, KcpStream};
-
-// C-compatible enum for Transport Protocol
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportProtocolC {
-    TCP = 0,
-    UDP = 1,
-    Unknown = 2, // Fallback
-}
+use crate::reliable::KcpStream;
 
 // C类型别名
 #[allow(non_camel_case_types)]
@@ -35,17 +28,8 @@ pub type EndpointHandle = *mut c_void;
 /// @param source_ip 发送者的IP地址（网络字节序）
 /// @param message_ptr 消息内容的指针
 /// @param message_len 消息长度
-/// @param protocol 传输协议
 #[allow(non_camel_case_types)]
-pub type MessageCallback = extern "C" fn(*const u8, *const u8, size_t, TransportProtocolC) -> ();
-
-/// KCP流句柄
-#[allow(non_camel_case_types)]
-pub type KcpStreamHandle = *mut c_void;
-
-/// KCP监听器句柄
-#[allow(non_camel_case_types)]
-pub type KcpListenerHandle = *mut c_void;
+pub type MessageCallback = extern "C" fn(*const u8, *const u8, size_t) -> ();
 
 /// 加密算法类型
 #[repr(C)]
@@ -69,6 +53,7 @@ pub enum NatTypeC {
 pub enum TransportType {
     Tcp = 0, // TCP传输
     Kcp = 1, // KCP传输
+    Udp = 2, // UDP传输
 }
 
 // Endpoint包装器，包含Endpoint和运行时
@@ -78,20 +63,7 @@ struct EndpointWrapper {
     shutdown_manager: ShutdownManager<()>,
     receiver_task: Option<tokio::task::JoinHandle<()>>,
     #[cfg(feature = "use-kcp")]
-    #[allow(dead_code)]
-    kcp_streams: std::collections::HashMap<u32, KcpStream>,
-}
-
-#[cfg(feature = "use-kcp")]
-struct KcpStreamWrapper {
-    stream: KcpStream,
-    runtime: tokio::runtime::Runtime,
-}
-
-#[cfg(feature = "use-kcp")]
-struct KcpListenerWrapper {
-    listener: KcpListener,
-    runtime: tokio::runtime::Runtime,
+    kcp_streams: Mutex<HashMap<String, KcpStream>>, // 使用IP字符串作为键存储KCP流
 }
 
 /// 初始化函数
@@ -102,17 +74,15 @@ struct KcpListenerWrapper {
 /// @param group_code 组代码
 /// @param password 密码字符串
 /// @param cipher_type 加密类型，参见 CipherType 枚举
-/// @param use_kcp 是否启用KCP传输，0表示不启用，1表示启用
 /// @return 成功返回EndpointHandle，失败返回NULL
 #[no_mangle]
 pub extern "C" fn rustp2p_init(
-    node_ip: *const c_char,    // IPv4地址字符串
+    node_ip: *const c_char,  // IPv4地址字符串
     tcp_port: u16,           // TCP端口
     udp_port: u16,           // UDP端口
     group_code: u32,         // 组代码
     password: *const c_char, // 密码字符串
     cipher_type: i32,        // 加密类型
-    use_kcp: i32,            // 是否启用KCP传输
 ) -> EndpointHandle {
     // 安全转换
     if node_ip.is_null() || password.is_null() {
@@ -188,18 +158,6 @@ pub extern "C" fn rustp2p_init(
             }
         }
 
-        // 如果启用KCP，确保编译时启用了use-kcp特性
-        #[cfg(feature = "use-kcp")]
-        if use_kcp > 0 {
-            println!("启用KCP传输");
-        }
-
-        #[cfg(not(feature = "use-kcp"))]
-        if use_kcp > 0 {
-            println!("KCP传输未启用，请在编译时启用use-kcp特性");
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "KCP传输未启用"));
-        }
-
         builder.build().await
     });
 
@@ -214,7 +172,7 @@ pub extern "C" fn rustp2p_init(
                 shutdown_manager,
                 receiver_task: None,
                 #[cfg(feature = "use-kcp")]
-                kcp_streams: std::collections::HashMap::new(),
+                kcp_streams: Mutex::new(HashMap::new()),
             });
             Box::into_raw(boxed) as EndpointHandle
         }
@@ -269,7 +227,6 @@ pub extern "C" fn rustp2p_add_peer(handle: EndpointHandle, peer_address: *const 
 /// @param data 消息数据
 /// @param data_len 消息长度
 /// @param reliable 是否使用可靠传输 (1=同步/可靠, 0=异步/不可靠)
-/// @param protocol_used 用来存储使用的协议（TCP/UDP），0表示TCP，1表示UDP，2表示未知
 /// @return 成功返回true，失败返回false
 #[no_mangle]
 pub extern "C" fn rustp2p_send(
@@ -278,7 +235,6 @@ pub extern "C" fn rustp2p_send(
     data: *const u8,
     data_len: size_t,
     reliable: i32,
-    protocol_used: *mut i32,
 ) -> bool {
     if handle.is_null() || peer_ip.is_null() || data.is_null() || data_len == 0 {
         return false;
@@ -299,44 +255,87 @@ pub extern "C" fn rustp2p_send(
         Ok(ip) => ip,
         Err(_) => return false,
     };
-    
+
     let node_id = NodeID::from(peer_id);
 
     // 将C指针转换为Rust切片
     let buffer = unsafe { std::slice::from_raw_parts(data, data_len) };
 
-    // 设置协议为未知（简化协议检测）
-    if !protocol_used.is_null() {
-        unsafe {
-            *protocol_used = TransportProtocolC::Unknown as i32;
-        }
-    }
-
     if reliable > 0 {
-        // 可靠传输：同步发送
-        // 删除发送前的路由发现代码
-        
-        // 尝试发送消息
-        let mut success = false;
-        let endpoint_clone_send = wrapper.endpoint.clone();
-        
-        for _i in 0..3 {
-            // 发送消息
-            let result = wrapper
-                .runtime
-                .block_on(async {
-                     endpoint_clone_send.send_to(buffer, node_id).await
-                });
+        // 可靠传输：优先使用KCP (如果可用)
+        #[cfg(feature = "use-kcp")]
+        {
+            // 尝试使用或创建KCP流
+            let result = wrapper.runtime.block_on(async {
+                // 尝试获取已存在的KCP流
+                let mut kcp_streams = wrapper.kcp_streams.lock().unwrap();
 
-            if let Ok(_) = result {
-                success = true;
-                break;
-            } else {
-                // 发送失败，稍等片刻后重试
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+                if !kcp_streams.contains_key(peer_ip_str) {
+                    // 需要创建新的KCP流
+                    match wrapper.endpoint.open_kcp_stream(node_id) {
+                        Ok(stream) => {
+                            kcp_streams.insert(peer_ip_str.to_string(), stream);
+                            log::debug!("[KCP] 创建新的KCP流到 {}", peer_ip_str);
+                            println!("[KCP] 创建新的KCP流到 {}", peer_ip_str);
+                        }
+                        Err(e) => {
+                            log::debug!("[KCP] 创建KCP流到 {} 失败: {:?}", peer_ip_str, e);
+                            println!("[KCP] 创建KCP流到 {} 失败: {:?}", peer_ip_str, e);
+                            // 如果无法创建KCP流，回退到普通发送
+                            return wrapper.endpoint.send_to(buffer, node_id).await.is_ok();
+                        }
+                    }
+                }
+
+                // 现在我们应该有一个KCP流了
+                if let Some(stream) = kcp_streams.get_mut(peer_ip_str) {
+                    // 使用KCP流发送数据
+                    match stream.write_all(buffer).await {
+                        Ok(_) => {
+                            log::debug!("[KCP] 通过KCP发送 {} 字节到 {}", buffer.len(), peer_ip_str);
+                            println!("[KCP] 通过KCP发送 {} 字节到 {}", buffer.len(), peer_ip_str);
+                            true
+                        }
+                        Err(e) => {
+                            log::debug!("[KCP] 发送到 {} 出错: {:?}", peer_ip_str, e);
+                            println!("[KCP] 发送到 {} 出错: {:?}", peer_ip_str, e);
+                            // 移除错误的连接
+                            kcp_streams.remove(peer_ip_str);
+                            // 回退到普通发送
+                            wrapper.endpoint.send_to(buffer, node_id).await.is_ok()
+                        }
+                    }
+                } else {
+                    // 这应该不会发生，但以防万一
+                    wrapper.endpoint.send_to(buffer, node_id).await.is_ok()
+                }
+            });
+            return result;
         }
-        success
+
+        // 如果未启用KCP，或者上面的KCP代码没有执行，则回退到普通可靠发送
+        #[cfg(not(feature = "use-kcp"))]
+        {
+            // 尝试发送消息
+            let mut success = false;
+            let endpoint_clone_send = wrapper.endpoint.clone();
+
+            for _i in 0..3 {
+                // 发送消息
+                let result = wrapper
+                    .runtime
+                    .block_on(async { endpoint_clone_send.send_to(buffer, node_id).await });
+
+                if let Ok(_) = result {
+                    success = true;
+                    break;
+                } else {
+                    // 发送失败，稍等片刻后重试
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            success
+        }
     } else {
         // 不可靠传输：异步发送
         // 复制数据，因为异步任务可能在原始数据被释放后才执行
@@ -352,7 +351,11 @@ pub extern "C" fn rustp2p_send(
                     // 发送成功
                 }
                 Err(e) => {
-                    log::error!("[FFI Async] Failed to send message to {:?}: {:?}", node_id, e);
+                    log::error!(
+                        "[FFI Async] Failed to send message to {:?}: {:?}",
+                        node_id,
+                        e
+                    );
                 }
             }
         });
@@ -381,7 +384,8 @@ pub extern "C" fn rustp2p_start_receiver(
     let runtime_handle = wrapper.runtime.handle().clone();
     let shutdown_manager = wrapper.shutdown_manager.clone();
 
-    let task = runtime_handle.spawn(async move {
+    // 常规消息接收任务
+    let normal_task = runtime_handle.spawn(async move {
         log::info!("[FFI Receiver] Started");
         loop {
             tokio::select! {
@@ -406,13 +410,10 @@ pub extern "C" fn rustp2p_start_receiver(
                                 }
                             };
 
-                            // 简化协议处理，统一设为未知（不再尝试检测）
-                            let protocol = TransportProtocolC::Unknown;
-
                             // 获取数据并调用回调函数
                             let payload = data.payload();
                             // 不再转换为指针，直接传递字节数组的引用
-                            callback(sender_ip_net.as_ptr(), payload.as_ptr(), payload.len(), protocol);
+                            callback(sender_ip_net.as_ptr(), payload.as_ptr(), payload.len());
                         }
                         Ok(Err(e)) => {
                             // 仅记录非超时错误
@@ -430,7 +431,125 @@ pub extern "C" fn rustp2p_start_receiver(
         log::info!("[FFI Receiver] Stopped");
     });
 
-    wrapper.receiver_task = Some(task);
+    #[cfg(feature = "use-kcp")]
+    {
+        // KCP 接收任务 - 直接启动而不赋值给变量
+        let endpoint_clone = wrapper.endpoint.clone();
+        let shutdown_manager_clone = wrapper.shutdown_manager.clone();
+        
+        runtime_handle.spawn(async move {
+            log::info!("[KCP] 接收器已启动");
+            println!("[KCP] 接收器已启动");
+            
+            // 创建KCP监听器
+            let kcp_listener = endpoint_clone.kcp_listener();
+            
+            loop {
+                tokio::select! {
+                    biased; // 优先处理关闭信号
+                    _ = shutdown_manager_clone.wait_shutdown_triggered() => {
+                        log::info!("[KCP] 接收到关闭信号");
+                        println!("[KCP] 接收到关闭信号");
+                        break;
+                    }
+                    accept_result = tokio::time::timeout(std::time::Duration::from_millis(500), kcp_listener.accept()) => {
+                        match accept_result {
+                            Ok(Ok((mut stream, remote_id))) => {
+                                let remote_ip = match TryInto::<Ipv4Addr>::try_into(remote_id) {
+                                    Ok(addr) => addr.octets(),
+                                    Err(_) => continue, // 跳过无效的ID
+                                };
+                                
+                                // 提取IP字符串用于日志
+                                let ip_str = TryInto::<Ipv4Addr>::try_into(remote_id)
+                                    .map(|addr| addr.to_string())
+                                    .unwrap_or_else(|_| "unknown".to_string());
+
+                                log::debug!("[KCP] 接受来自 {} 的新连接", ip_str);
+                                println!("[KCP] 接受来自 {} 的新连接", ip_str);
+                                
+                                // 为每个连接创建一个专门的处理任务
+                                let callback_clone = callback;
+                                let shutdown_manager_clone = shutdown_manager_clone.clone();
+                                
+                                tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 4096];
+                                    
+                                    loop {
+                                        tokio::select! {
+                                            biased; // 优先处理关闭信号
+                                            _ = shutdown_manager_clone.wait_shutdown_triggered() => {
+                                                break;
+                                            }
+                                            read_result = tokio::time::timeout(
+                                                std::time::Duration::from_secs(60), // 60秒超时
+                                                stream.read(&mut buffer)
+                                            ) => {
+                                                match read_result {
+                                                    Ok(Ok(len)) => {
+                                                        if len == 0 {
+                                                            // 连接已关闭
+                                                            log::debug!("[KCP] 来自 {} 的连接已关闭", ip_str);
+                                                            println!("[KCP] 来自 {} 的连接已关闭", ip_str);
+                                                            break;
+                                                        }
+                                                        
+                                                        // 处理收到的KCP数据
+                                                        log::debug!("[KCP] 从 {} 接收到 {} 字节数据", ip_str, len);
+                                                        println!("[KCP] 从 {} 接收到 {} 字节数据", ip_str, len);
+                                                        callback_clone(
+                                                            remote_ip.as_ptr(),
+                                                            buffer.as_ptr(),
+                                                            len
+                                                        );
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        log::error!("[KCP] 从 {} 读取时出错: {}", ip_str, e);
+                                                        println!("[KCP] 从 {} 读取时出错: {}", ip_str, e);
+                                                        break;
+                                                    }
+                                                    Err(_) => {
+                                                        // 读取超时
+                                                        log::debug!("[KCP] 从 {} 读取超时", ip_str);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    log::debug!("[FFI KCP Stream] Reader task for {} terminated", ip_str);
+                                });
+                            }
+                            Ok(Err(e)) => {
+                                log::error!("[KCP] 接受连接错误: {}", e);
+                                println!("[KCP] 接受连接错误: {}", e);
+                                // 短暂暂停避免CPU过载
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            Err(_) => {
+                                // 接受连接超时，继续循环
+                            }
+                        }
+                    }
+                }
+            }
+            
+            log::info!("[KCP] 接收器已停止");
+            println!("[KCP] 接收器已停止");
+        });
+    }
+
+    #[cfg(feature = "use-kcp")]
+    {
+        wrapper.receiver_task = Some(normal_task);
+    }
+    
+    #[cfg(not(feature = "use-kcp"))]
+    {
+        wrapper.receiver_task = Some(normal_task);
+    }
+    
     true
 }
 
@@ -463,7 +582,7 @@ pub extern "C" fn rustp2p_stop_receiver(handle: EndpointHandle) -> bool {
         match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
             Ok(Ok(_)) => true,
             Ok(Err(_)) => false, // 任务出错或被取消
-            Err(_) => false, // 超时
+            Err(_) => false,     // 超时
         }
     });
 
@@ -481,34 +600,46 @@ pub extern "C" fn rustp2p_cleanup(handle: EndpointHandle, timeout_ms: u64) -> bo
     }
 
     let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
-    
+
     // 使用提供的超时时间，如果为0则使用默认值
     let actual_timeout = if timeout_ms == 0 { 1000 } else { timeout_ms };
-    
+
     // 1. 触发关闭信号
     let signal_result = wrapper.shutdown_manager.trigger_shutdown(()).is_ok();
-    
+
     // 2. 等待接收器任务完成
     let mut task_completed = true;
     if let Some(task) = wrapper.receiver_task.take() {
         let runtime_handle = wrapper.runtime.handle().clone();
         task_completed = runtime_handle.block_on(async {
-            match tokio::time::timeout(std::time::Duration::from_millis(actual_timeout), task).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(actual_timeout), task).await
+            {
                 Ok(Ok(_)) => true,
                 Ok(Err(_)) => false, // 任务出错或被取消
                 Err(_) => false,     // 超时
             }
         });
     }
-    
+
     // 3. 获取EndpointWrapper的所有权并释放资源
     let boxed_wrapper = unsafe { Box::from_raw(handle as *mut EndpointWrapper) };
-    let EndpointWrapper { endpoint, runtime, .. } = *boxed_wrapper;
-    
+
+    // 关闭所有KCP流
+    #[cfg(feature = "use-kcp")]
+    {
+        if let Ok(mut kcp_streams) = boxed_wrapper.kcp_streams.lock() {
+            kcp_streams.clear();
+        }
+    }
+
     // 4. 清理资源
+    let EndpointWrapper {
+        endpoint, runtime, ..
+    } = *boxed_wrapper;
+
     drop(endpoint);
     runtime.shutdown_background();
-    
+
     signal_result && task_completed
 }
 
@@ -564,356 +695,10 @@ pub extern "C" fn rustp2p_get_nat_info(
     result
 }
 
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_open_kcp_stream(handle: EndpointHandle, peer_ip: u32) -> KcpStreamHandle {
-    if handle.is_null() {
-        println!("[FFI] rustp2p_open_kcp_stream: handle is null");
-        return std::ptr::null_mut();
-    }
-
-    let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
-    let peer_id = Ipv4Addr::from(peer_ip.to_be_bytes());
-    let node_id = NodeID::from(peer_id);
-
-    println!(
-        "[FFI] rustp2p_open_kcp_stream: Opening KCP stream to {}",
-        peer_id
-    );
-
-    let endpoint_clone = wrapper.endpoint.clone();
-    let stream_result = wrapper.runtime.block_on(async {
-        println!("[FFI] rustp2p_open_kcp_stream: Sending hello messages to establish UDP route");
-        let mut route_established = false;
-        for i in 0..15 { 
-            println!(
-                "[FFI] rustp2p_open_kcp_stream: Sending hello message attempt {}",
-                i + 1
-            );
-            if let Ok(_) = endpoint_clone
-                .send_to(b"hello from kcp init", node_id)
-                .await
-            {
-                println!("[FFI] rustp2p_open_kcp_stream: Hello message sent successfully");
-                route_established = true;
-                for _ in 0..3 {
-                    let _ = endpoint_clone
-                        .send_to(b"hello from kcp init", node_id)
-                        .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                break;
-            }
-            println!("[FFI] rustp2p_open_kcp_stream: Hello message failed, retrying...");
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-
-        if !route_established {
-            println!("[FFI] rustp2p_open_kcp_stream: Route establishment failed, trying direct KCP stream creation");
-            for _ in 0..5 {
-                let _ = endpoint_clone.send_to(b"route_discovery", node_id).await;
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-        println!("[FFI] rustp2p_open_kcp_stream: Creating KCP stream");
-        endpoint_clone.open_kcp_stream(node_id)
-    });
-
-    match stream_result {
-        Ok(mut stream) => {
-            println!("[FFI] rustp2p_open_kcp_stream: KCP stream created successfully");
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(rt) => {
-                    println!("[FFI] rustp2p_open_kcp_stream: Runtime created successfully");
-                    rt
-                }
-                Err(e) => {
-                    println!(
-                        "[FFI] rustp2p_open_kcp_stream: Failed to create runtime: {}",
-                        e
-                    );
-                    return std::ptr::null_mut();
-                }
-            };
-
-            let init_result = runtime.block_on(async {
-                println!(
-                    "[FFI] rustp2p_open_kcp_stream: Sending initial message to confirm connection"
-                );
-                stream.write_all(b"kcp_stream_init").await
-            });
-
-            if let Err(e) = init_result {
-                println!(
-                    "[FFI] rustp2p_open_kcp_stream: Failed to send initial message: {}",
-                    e
-                );
-            }
-
-            println!("[FFI] rustp2p_open_kcp_stream: Returning KCP stream handle");
-            Box::into_raw(Box::new(KcpStreamWrapper { stream, runtime })) as KcpStreamHandle
-        }
-        Err(e) => {
-            println!(
-                "[FFI] rustp2p_open_kcp_stream: Failed to create KCP stream: {:?}",
-                e
-            );
-            std::ptr::null_mut()
-        }
-    }
-}
-
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_kcp_stream_send(
-    handle: KcpStreamHandle,
-    data: *const u8,
-    data_len: size_t,
-) -> bool {
-    if handle.is_null() || data.is_null() || data_len == 0 {
-        println!("[FFI] rustp2p_kcp_stream_send: Invalid parameters");
-        return false;
-    }
-
-    println!("[FFI] rustp2p_kcp_stream_send: Sending {} bytes", data_len);
-    let wrapper = unsafe { &mut *(handle as *mut KcpStreamWrapper) };
-
-    let buffer = unsafe { std::slice::from_raw_parts(data, data_len) };
-
-    let send_result = wrapper.runtime.block_on(async {
-        println!("[FFI] rustp2p_kcp_stream_send: Writing to KCP stream");
-        wrapper.stream.write_all(buffer).await
-    });
-
-    match send_result {
-        Ok(_) => {
-            println!("[FFI] rustp2p_kcp_stream_send: Send successful");
-            true
-        }
-        Err(e) => {
-            println!("[FFI] rustp2p_kcp_stream_send: Send failed: {}", e);
-            false
-        }
-    }
-}
-
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_kcp_stream_recv(
-    handle: KcpStreamHandle,
-    buffer: *mut u8,
-    buffer_len: size_t,
-    bytes_read: *mut size_t,
-) -> bool {
-    if handle.is_null() || buffer.is_null() || buffer_len == 0 || bytes_read.is_null() {
-        println!("[FFI] rustp2p_kcp_stream_recv: Invalid parameters");
-        return false;
-    }
-
-    println!(
-        "[FFI] rustp2p_kcp_stream_recv: Receiving with buffer size {}",
-        buffer_len
-    );
-    let wrapper = unsafe { &mut *(handle as *mut KcpStreamWrapper) };
-
-    let mut rust_buffer = vec![0u8; buffer_len];
-
-    let result = wrapper.runtime.block_on(async {
-        println!("[FFI] rustp2p_kcp_stream_recv: Reading from KCP stream");
-        wrapper.stream.read(&mut rust_buffer).await
-    });
-
-    match result {
-        Ok(len) => {
-            println!("[FFI] rustp2p_kcp_stream_recv: Received {} bytes", len);
-            unsafe {
-                std::ptr::copy_nonoverlapping(rust_buffer.as_ptr(), buffer, len);
-                *bytes_read = len;
-            }
-            true
-        }
-        Err(e) => {
-            println!("[FFI] rustp2p_kcp_stream_recv: Receive failed: {}", e);
-            false
-        }
-    }
-}
-
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_close_kcp_stream(handle: KcpStreamHandle) {
-    if !handle.is_null() {
-        unsafe {
-            let _boxed = Box::from_raw(handle as *mut KcpStreamWrapper);
-        }
-    }
-}
-
-/// 创建KCP监听器
-///
-/// @param handle EndpointHandle
-/// @return 成功返回KcpListenerHandle，失败返回NULL
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_create_kcp_listener(handle: EndpointHandle) -> KcpListenerHandle {
-    if handle.is_null() {
-        println!("[FFI] rustp2p_create_kcp_listener: handle is null");
-        return std::ptr::null_mut();
-    }
-
-    println!("[FFI] rustp2p_create_kcp_listener: Creating KCP listener");
-    let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
-
-    let listener = wrapper.endpoint.kcp_listener();
-    println!("[FFI] rustp2p_create_kcp_listener: KCP listener created");
-
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => {
-            println!("[FFI] rustp2p_create_kcp_listener: Runtime created successfully");
-            rt
-        }
-        Err(e) => {
-            println!(
-                "[FFI] rustp2p_create_kcp_listener: Failed to create runtime: {}",
-                e
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let _keep_alive = runtime.spawn(async {
-        println!(
-            "[FFI] rustp2p_create_kcp_listener: Starting background task to keep runtime alive"
-        );
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    });
-
-    println!("[FFI] rustp2p_create_kcp_listener: Returning KCP listener handle");
-    Box::into_raw(Box::new(KcpListenerWrapper { listener, runtime })) as KcpListenerHandle
-}
-
-/// 接受KCP连接
-///
-/// @param handle KcpListenerHandle
-/// @param node_id_out 输出参数，连接的节点ID（网络字节序）
-/// @return 成功返回KcpStreamHandle，失败返回NULL
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_accept_kcp_connection(
-    handle: KcpListenerHandle,
-    node_id_out: *mut u32,
-) -> KcpStreamHandle {
-    if handle.is_null() || node_id_out.is_null() {
-        println!("[FFI] rustp2p_accept_kcp_connection: Invalid parameters");
-        return std::ptr::null_mut();
-    }
-
-    println!("[FFI] rustp2p_accept_kcp_connection: Accepting KCP connection");
-    let wrapper = unsafe { &mut *(handle as *mut KcpListenerWrapper) };
-
-    let result = wrapper.runtime.block_on(async {
-        println!("[FFI] rustp2p_accept_kcp_connection: Waiting for connection");
-
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-        for i in 0..5 {
-            println!("[FFI] rustp2p_accept_kcp_connection: Attempt {} to accept connection", i + 1);
-
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                wrapper.listener.accept(),
-            )
-            .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    println!("[FFI] rustp2p_accept_kcp_connection: Timeout waiting for connection on attempt {}", i + 1);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-        }
-
-        println!("[FFI] rustp2p_accept_kcp_connection: All attempts failed, trying one last time");
-        wrapper.listener.accept().await
-    });
-
-    match result {
-        Ok((mut stream, node_id)) => {
-            println!(
-                "[FFI] rustp2p_accept_kcp_connection: Connection accepted from {:?}",
-                node_id
-            );
-            let ipv4 = TryInto::<Ipv4Addr>::try_into(node_id).unwrap();
-            let ip_bytes = ipv4.octets();
-            let ip_uint32 = u32::from_be_bytes(ip_bytes);
-            unsafe { *node_id_out = ip_uint32 };
-            println!(
-                "[FFI] rustp2p_accept_kcp_connection: Node ID set to {}",
-                ipv4
-            );
-
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(rt) => {
-                    println!("[FFI] rustp2p_accept_kcp_connection: Runtime created successfully");
-                    rt
-                }
-                Err(e) => {
-                    println!(
-                        "[FFI] rustp2p_accept_kcp_connection: Failed to create runtime: {}",
-                        e
-                    );
-                    return std::ptr::null_mut();
-                }
-            };
-
-            let reply_result = runtime.block_on(async {
-                println!("[FFI] rustp2p_accept_kcp_connection: Sending confirmation message");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                stream.write_all(b"kcp_connection_accepted").await
-            });
-
-            if let Err(e) = reply_result {
-                println!(
-                    "[FFI] rustp2p_accept_kcp_connection: Failed to send confirmation message: {}",
-                    e
-                );
-            }
-
-            println!("[FFI] rustp2p_accept_kcp_connection: Returning KCP stream handle");
-            Box::into_raw(Box::new(KcpStreamWrapper { stream, runtime })) as KcpStreamHandle
-        }
-        Err(e) => {
-            println!(
-                "[FFI] rustp2p_accept_kcp_connection: Accept failed: {:?}",
-                e
-            );
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// 关闭KCP监听器
-///
-/// @param handle KcpListenerHandle
-#[cfg(feature = "use-kcp")]
-#[no_mangle]
-pub extern "C" fn rustp2p_close_kcp_listener(handle: KcpListenerHandle) {
-    if !handle.is_null() {
-        unsafe {
-            let _boxed = Box::from_raw(handle as *mut KcpListenerWrapper);
-        }
-    }
-}
-
 /// 获取可靠隧道信息
 ///
 /// @param handle EndpointHandle
-/// @param tunnel_type 输出参数，隧道类型（TCP或KCP）
+/// @param tunnel_type 输出参数，隧道类型（TCP、KCP或UDP）
 /// @param connected_peers 输出参数，已连接的对等节点数量
 /// @return 成功返回true，失败返回false
 #[no_mangle]
@@ -929,11 +714,71 @@ pub extern "C" fn rustp2p_get_tunnel_info(
     let wrapper = unsafe { &mut *(handle as *mut EndpointWrapper) };
 
     wrapper.runtime.handle().block_on(async {
-        let tunnel_type_value = TransportType::Tcp as i32;
-        unsafe { *tunnel_type = tunnel_type_value };
+        // 获取当前连接的节点信息
+        let direct_nodes = wrapper.endpoint.node_context().get_direct_nodes();
+        let peers_count = direct_nodes.len() as u32;
+        
+        // 分析节点使用的传输协议
+        let mut has_tcp = false;
+        let mut has_udp = false;
+        
+        for (node_addr, _) in direct_nodes {
+            match node_addr {
+                crate::tunnel::NodeAddress::Tcp(_) => has_tcp = true,
+                crate::tunnel::NodeAddress::Udp(_) => has_udp = true,
+            }
+        }
+        
+        // 检查是否启用了KCP
+        #[cfg(feature = "use-kcp")]
+        {
+            // 检查是否有活跃的KCP流
+            let is_kcp_active = {
+                if let Ok(kcp_streams) = wrapper.kcp_streams.lock() {
+                    !kcp_streams.is_empty()
+                } else {
+                    false
+                }
+            };
 
-        let peers_count = wrapper.endpoint.node_context().get_direct_nodes().len() as u32;
+            if is_kcp_active {
+                // KCP优先级最高（因为它是在TCP/UDP之上的可靠传输层）
+                unsafe { *tunnel_type = TransportType::Kcp as i32 };
+                log::debug!("当前使用KCP传输");
+            } else if has_tcp {
+                // 有TCP连接但没有KCP
+                unsafe { *tunnel_type = TransportType::Tcp as i32 };
+                log::debug!("当前使用TCP传输");
+            } else if has_udp {
+                // 只有UDP连接
+                unsafe { *tunnel_type = TransportType::Udp as i32 };
+                log::debug!("当前使用UDP传输");
+            } else {
+                // 默认为TCP
+                unsafe { *tunnel_type = TransportType::Tcp as i32 };
+                log::debug!("没有活跃连接，默认为TCP");
+            }
+        }
+        
+        #[cfg(not(feature = "use-kcp"))]
+        {
+            // 没有启用KCP，只检查TCP和UDP
+            if has_tcp {
+                unsafe { *tunnel_type = TransportType::Tcp as i32 };
+                log::debug!("当前使用TCP传输");
+            } else if has_udp {
+                unsafe { *tunnel_type = TransportType::Udp as i32 };
+                log::debug!("当前使用UDP传输");
+            } else {
+                // 默认为TCP
+                unsafe { *tunnel_type = TransportType::Tcp as i32 };
+                log::debug!("没有活跃连接，默认为TCP");
+            }
+        }
+
+        // 设置已连接的对等节点数量
         unsafe { *connected_peers = peers_count };
+        log::debug!("已连接的对等节点数量: {}", peers_count);
     });
 
     true
